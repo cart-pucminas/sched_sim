@@ -41,7 +41,7 @@ use log::debug;
 // Enum
 //==================================================================================================
 enum Scheduler {
-    FIFO {
+    Fifo {
 	current: usize,
     },
     RoundRobin {
@@ -50,8 +50,13 @@ enum Scheduler {
 }
 
 enum Mapper {
-    FIFO,
+    Fifo,
 }
+
+//==================================================================================================
+// Aliases
+//==================================================================================================
+type TaskMessage = (Task, oneshot::Sender<Task>);
 
 //==================================================================================================
 // Structures
@@ -68,7 +73,7 @@ pub struct VM
     vm_total_task_count : Arc<AtomicUsize>,
 	
     /// VCPU's senders (mpsc) (private field)
-    vcpu_senders	: Arc<Vec<mpsc::Sender<(Task, oneshot::Sender<Task>)>>>,
+    vcpu_senders	: Arc<Vec<mpsc::Sender<TaskMessage>>>,
     /// List of finished `Task`s inside the `VM` (private field)
     vm_tasks_finished	: Arc<Mutex<VecDeque<Task>>>,
     /// List of ready `Task`s inside the `VM` (private field)
@@ -92,7 +97,7 @@ impl Scheduler {
     // TODO: Add a strategy that analyzes which vCPU currently has less workload in it.
     pub async fn select_vcpu(&mut self, vm: &VM) -> usize {
 	match self {
-	    Scheduler::FIFO { current } => {
+	    Scheduler::Fifo { current } => {
 		debug!(
 		    "[VM {}] Selected vCPU ({}) - FIFO ({:?})",
 		    vm.clone().vm_get_id(),
@@ -121,7 +126,7 @@ impl Scheduler {
 
     pub fn is_preemptive(&self) -> bool {
 	match self {
-	    Scheduler::FIFO { .. } => false,
+	    Scheduler::Fifo { .. } => false,
 	    Scheduler::RoundRobin { .. } => true,
 	}}
 }
@@ -129,7 +134,7 @@ impl Scheduler {
 impl Mapper {
     pub async fn select_task(&mut self, vm: &VM) -> Option<Task> {
 	match self {
-	    Mapper::FIFO => {
+	    Mapper::Fifo => {
 		let task_opt = vm.clone().vm_tasks_ready().lock().await.pop_front();
 		    match &task_opt {
 		    Some(task) => {
@@ -185,7 +190,7 @@ impl VM
 	);
 	let vm_scheduler = match desired_scheduler {
 	    "FIFO" => {
-		Arc::new(Mutex::new(Scheduler::FIFO { current: 0 }))
+		Arc::new(Mutex::new(Scheduler::Fifo { current: 0 }))
 	    },
 	    "RoundRobin" => {
 		Arc::new(Mutex::new(Scheduler::RoundRobin { current: 0 }))
@@ -202,7 +207,7 @@ impl VM
 	
 	let vm_mapper = match desired_mapper {
 	    "FIFO" => {
-		Arc::new(Mutex::new(Mapper::FIFO))
+		Arc::new(Mutex::new(Mapper::Fifo))
 	    },
 	    &_ => {
 		return Err(anyhow::anyhow!("invalid mapper"));
@@ -315,63 +320,6 @@ impl VM
 	debug!("[VM {}] Finished processing.", self.vm_get_id());
     }
     
-    // pub async fn schedule(self: Arc<Self>) {
-    // 	loop {
-    // 	    // If a Task is sent, add it into task_ready, allowing mapper to pick that task
-    // 	    let selected_task_opt = self.mapper.lock().await.select_task(&self).await;
-	    
-    // 	    if let Some(mut selected_task) = selected_task_opt {
-    // 		// Setting task to running queue
-    // 		self.vm_tasks_running.lock().await.push_back(selected_task.clone());
-		
-    // 		let selected_vcpu = self.scheduler.lock().await.select_vcpu(&self).await;
-
-    // 		let mut execution_time = selected_task.task_left_workload();
-    // 		if self.preemptive {
-    // 		    execution_time = execution_time.min(self.quantum);
-    // 		}
-		
-
-    // 		let transmitter = &self.vcpu_senders[selected_vcpu];
-    // 		debug!("[VM {}] Transmitting Task {} to vCPU {} ({:?})",
-    // 		       self.vm_id,
-    // 		       selected_task.task_ts_id(),
-    // 		       self.vm_vcpus[selected_vcpu].lock().await.clone().vcpu_id(),
-    // 		       thread::current().id(),
-    // 		);
-
-    // 		selected_task.task_set_current_workload(execution_time);
-    // 		// TODO: ver se tem alguma maneira de ficar enviando as Tarefas de maneira paralela às vCPUs, sem ter que esperar que a vCPU termine sua execução para enviar outra. Ademais, voltar com a lógica de task transmitters
-    // 		if transmitter.send(selected_task.clone()).await.is_ok() {
-    // 		    selected_task.task_process_workload(execution_time);			 
-    // 		    let mut running = self.vm_tasks_running.lock().await;
-    // 		    running.retain(|t| t.task_ts_id() != selected_task.task_ts_id());
-		   
-    // 		    // Still has work to do (Occurs only when there is preemption) 
-    // 		    if selected_task.task_left_workload() > 0 {
-    // 			let mut ready = self.vm_tasks_ready.lock().await;
-    // 			ready.push_back(selected_task);
-			
-    // 			// Work has finished
-    // 		    } else {
-    // 			debug!("Task {} finished.", selected_task.task_ts_id());
-    // 			let mut finished = self.vm_tasks_finished.lock().await;
-    // 			finished.push_back(selected_task);
-    // 		    }
-    // 		} else {
-    // 		    let mut ready = self.vm_tasks_ready.lock().await;
-    // 		    ready.push_back(selected_task);
-		    
-    // 		}
-
-    // 	    }
-    // 	    else {
-    // 		break;
-    // 	    }
-    // 	}
-    // 	debug!("[VM {}] Finished processing.", self.vm_get_id());
-    // }
-
     /// Returns (if exists) the index of a `Task` in `vm_tasks_ready` with specified `task_id`
     /// 
     /// # Arguments
@@ -410,7 +358,7 @@ impl VM
     /// # Arguments
     /// 
     /// * `task` - A VM's task.
-    pub async fn vm_task_ready_add(&mut self, task: Task) -> () {
+    pub async fn vm_task_ready_add(&mut self, task: Task) {
 	debug!("[VM {:?}] Adding task {:?}", self.vm_id, task.task_ts_id());
 	self.vm_tasks_ready.lock().await.push_back(task);
     }
@@ -419,7 +367,7 @@ impl VM
 	self.vm_tasks_ready
     }
    
-    fn vm_vcpus_senders(&self) -> Arc<Vec<mpsc::Sender<(Task, oneshot::Sender<Task>)>>>{ 
+    fn vm_vcpus_senders(&self) -> Arc<Vec<mpsc::Sender<TaskMessage>>>{ 
 	self.vcpu_senders.clone()
     }
     

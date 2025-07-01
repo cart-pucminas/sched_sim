@@ -119,7 +119,7 @@ impl Task
 	self.ts_current_workload
     }
 
-    pub fn task_set_current_workload(&mut self, processed_workload: u64) -> () {
+    pub fn task_set_current_workload(&mut self, processed_workload: u64) {
 	self.ts_current_workload = processed_workload;
     }
     

@@ -11,6 +11,7 @@ use task_lib::Task;
 use vcpu_lib::VCPU;
 
 use std::{
+    time::Instant,
     collections::VecDeque,
     sync::{
 	atomic::{
@@ -66,28 +67,30 @@ type TaskMessage = (Task, oneshot::Sender<Task>);
 pub struct VM
 {
     /// `VM` unique identifier (private field)
-    vm_id		: u8,
+    vm_id			: u8,
     /// Pool of `VCPUs` that VM has (private field)
-    vm_vcpus		: Vec<Arc<Mutex<VCPU>>>,
+    vm_vcpus			: Vec<Arc<Mutex<VCPU>>>,
     
-    vm_total_task_count : Arc<AtomicUsize>,
-	
+    vm_total_task_count		: Arc<AtomicUsize>,
+    
+    pub contention_time_nanos	: Arc<AtomicUsize>,
+    
     /// VCPU's senders (mpsc) (private field)
-    vcpu_senders	: Arc<Vec<mpsc::Sender<TaskMessage>>>,
+    vcpu_senders		: Arc<Vec<mpsc::Sender<TaskMessage>>>,
     /// List of finished `Task`s inside the `VM` (private field)
-    vm_tasks_finished	: Arc<Mutex<VecDeque<Task>>>,
+    vm_tasks_finished		: Arc<Mutex<VecDeque<Task>>>,
     /// List of ready `Task`s inside the `VM` (private field)
-    vm_tasks_ready	: Arc<Mutex<VecDeque<Task>>>,
+    vm_tasks_ready		: Arc<Mutex<VecDeque<Task>>>,
     /// List of running `Task`s inside the `VM` (private field)
-    vm_tasks_running	: Arc<Mutex<VecDeque<Task>>>,
+    vm_tasks_running		: Arc<Mutex<VecDeque<Task>>>,
     /// `VM`'s Task-vCPU Scheduler (private field)
-    scheduler		: Arc<Mutex<Scheduler>>,
+    scheduler			: Arc<Mutex<Scheduler>>,
     /// `VM`'s Task-vCPU Mapper (private field)
-    mapper		: Arc<Mutex<Mapper>>,
+    mapper			: Arc<Mutex<Mapper>>,
     /// `VM`'s Quantum, if preemptive (private field)
-    quantum		: u64,
+    quantum			: u64,
     /// If current scheduling strategy is preemptive (private field)
-    preemptive		: bool,
+    preemptive			: bool,
 }
 
 //==================================================================================================
@@ -135,7 +138,9 @@ impl Mapper {
     pub async fn select_task(&mut self, vm: &VM) -> Option<Task> {
 	match self {
 	    Mapper::Fifo => {
+		let start = Instant::now();
 		let task_opt = vm.clone().vm_tasks_ready().lock().await.pop_front();
+		vm.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 		    match &task_opt {
 		    Some(task) => {
 			debug!(
@@ -200,10 +205,13 @@ impl VM
 	    },
 	};
 	
+	let start = Instant::now();
 	let preemptive: bool = {
 	    let preemptive_guard = vm_scheduler.lock().await;
 	    preemptive_guard.is_preemptive()
 	};
+	let mut contention_time_nanos = Arc::new(AtomicUsize::new(0));
+	contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 	
 	let vm_mapper = match desired_mapper {
 	    "FIFO" => {
@@ -241,7 +249,8 @@ impl VM
 	Ok(Self {
 	       vm_id: id,
 	       vm_vcpus: vcpus,
-	       vm_total_task_count: num_tasks,	    
+	       vm_total_task_count: num_tasks,
+	       contention_time_nanos,
 	       vcpu_senders: Arc::new(senders),
 	       vm_tasks_finished: Arc::new(Mutex::new(VecDeque::new())),
                vm_tasks_ready: Arc::new(Mutex::new(VecDeque::new())),
@@ -258,17 +267,23 @@ impl VM
 	mut completion_receiver: mpsc::Receiver<(Task, u64)>
     ) {
 	while let Some((mut task, execution_time)) = completion_receiver.recv().await {
+	    let start = Instant::now();
 	    self.vm_tasks_running.lock().await.retain(|t| t.task_ts_id() != task.task_ts_id());
+	    self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 	    
 	    task.task_process_workload(execution_time);
 	    
 	    // Still has work to do (Occurs only when there is preeption)
 	    if task.task_left_workload() > 0 {
+		let start = Instant::now();
 		self.vm_tasks_ready.lock().await.push_back(task);
+		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 	    } else {
+		let start = Instant::now();
 		self.vm_total_task_count.fetch_sub(1, Ordering::SeqCst);
 		debug!("Task {} finished.", task.task_ts_id());
 		self.vm_tasks_finished.lock().await.push_back(task);
+		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 	    }
 	    
 	}
@@ -284,13 +299,19 @@ impl VM
 	    if self.vm_total_task_count.load(Ordering::SeqCst) == 0 {
 		break;
 	    }
-	    
+
+	    let start = Instant::now();
 	    let selected_task_opt = self.mapper.lock().await.select_task(&self).await;
+	    self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 
 	    if let Some(mut task) = selected_task_opt {
+		let start = Instant::now();
 		self.vm_tasks_running.lock().await.push_back(task.clone());
-		
+		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
+
+		let start = Instant::now();
 		let selected_vcpu = self.scheduler.lock().await.select_vcpu(&self).await;
+		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 
 		let mut execution_time = task.task_left_workload();
 		if self.preemptive {
@@ -309,7 +330,9 @@ impl VM
 		    
 		    // If failed to send task, readd task to be sent elsewhere
 		} else {
+		    let start = Instant::now();
 		    self.vm_tasks_ready.lock().await.push_front(task);
+		    self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 		}
 	    } else {
 		tokio::time::sleep(Duration::from_millis(100)).await;
@@ -360,7 +383,9 @@ impl VM
     /// * `task` - A VM's task.
     pub async fn vm_task_ready_add(&mut self, task: Task) {
 	debug!("[VM {:?}] Adding task {:?}", self.vm_id, task.task_ts_id());
+	let start = Instant::now();
 	self.vm_tasks_ready.lock().await.push_back(task);
+	self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
     }
 
     fn vm_tasks_ready(self) -> Arc<Mutex<VecDeque<Task>>> {

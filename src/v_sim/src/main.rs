@@ -93,6 +93,8 @@ fn main() {
 	
 	schedule_tread.join().unwrap();
 	completion_tread.join().unwrap();
+	let elapsed = start.elapsed();
+	let contention = vm.contention_time_nanos.load(Ordering::Relaxed);
+	println!("{:?},{:?},{:.4}", elapsed, contention, (contention as f64 / elapsed.as_nanos() as f64) * 100.0);
     });
-    println!("Elapsed {:?}", start.elapsed());
 }

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+	# "src/hypervisor",
+	"src/v_sim",	
+	"src/task_lib",
+	"src/vcpu_lib",
+	"src/vm_lib",
+]	
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0.93"
+tokio = { version = "1.42.0", default-features = false }
+log = "0.4"
+env_logger = "0.11"

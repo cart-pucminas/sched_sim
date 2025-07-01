@@ -1,0 +1,12 @@
+[package]
+name = "v_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow          = { workspace = true				}
+task_lib	= { path = "../task_lib"			}
+vm_lib		= { path = "../vm_lib"				}
+log		= { workspace = true				}
+env_logger	= { workspace = true				}
+tokio           = { workspace = true, features = ["full"]	}

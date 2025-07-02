@@ -187,6 +187,7 @@ impl VM
 	desired_scheduler: &str,
 	desired_mapper: &str,
 	num_tasks: Arc<AtomicUsize>,
+	max_num_tasks: usize,
     ) -> Result<Self> {
 	debug!(
 	    "Creating VM ({}) with {} vcpus",
@@ -226,7 +227,7 @@ impl VM
 	
 	let mut vcpus: Vec<Arc<Mutex<VCPU>>> = Vec::with_capacity(num_vcpus);
 	for i in 0..num_vcpus {
-	    let (transmitter, receiver) = mpsc::channel(100);
+	    let (transmitter, receiver) = mpsc::channel(max_num_tasks);
 	    senders.push(transmitter);
 	    
 	    let vcpu = Arc::new(Mutex::new(VCPU::new(id + (i as u8), id)?));

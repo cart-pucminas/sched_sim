@@ -9,8 +9,7 @@ VERBOSE ?= yes
 #===================================================================================================
 ROOT_DIRECTORY := $(CURDIR)
 BINARIES_DIRECTORY := $(ROOT_DIRECTORY)/bin
-PLOTS_DIRECTORY := $(ROOT_DIRECTORY)/plots
-
+PLOTS_DIRECTORY := $(ROOT_DIRECTORY)/scripts/plot
 
 #===================================================================================================
 # Toolchain Configuration
@@ -39,9 +38,9 @@ make-directories:
 PLOTS_VENV_DIRECTORY := $(PLOTS_DIRECTORY)/venv
 
 all-plots:
-	@if [ ! -d $(PLOTS_VENV_DIRECTORY) ]; then python3 -m vevn $(PLOTS_VENV_DIRECTORY); fi
+	@if [ ! -d $(PLOTS_VENV_DIRECTORY) ]; then python3 -m venv $(PLOTS_VENV_DIRECTORY); fi
 	@$(PLOTS_VENV_DIRECTORY)/bin/pip3 install -r ./scripts/plot/requirements.txt > /dev/null
-# @$(PLOTS_VENV_DIRECTORY)/bin/python3 $(PLOTS_DIRECTORY)/results.py
+	@$(PLOTS_VENV_DIRECTORY)/bin/python3 $(PLOTS_DIRECTORY)/results.py
 
 check: check-v_sim
 

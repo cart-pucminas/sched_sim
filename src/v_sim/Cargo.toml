@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow          = { workspace = true				}
+mem_lib		= { path = "../mem_lib"				}
 task_lib	= { path = "../task_lib"			}
 vm_lib		= { path = "../vm_lib"				}
+ram_lib		= { path = "../ram_lib"				}	
 log		= { workspace = true				}
 env_logger	= { workspace = true				}
 tokio           = { workspace = true, features = ["full"]	}

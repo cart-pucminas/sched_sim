@@ -5,6 +5,10 @@ members = [
 	"src/task_lib",
 	"src/vcpu_lib",
 	"src/vm_lib",
+	"src/cache_lib",
+	"src/mem_lib",
+	"src/mmu_lib",			
+	"src/ram_lib",
 ]	
 resolver = "2"
 

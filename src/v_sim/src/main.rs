@@ -15,9 +15,14 @@ use anyhow::Result;
 use args::Args;
 use task_lib::Task;
 use vm_lib::VM;
+use mem_lib::Addr;
+use ram_lib::RAM;
 use log::debug;
 use tokio::{
-    sync::mpsc,
+    sync::{
+	mpsc,
+	Mutex,
+    },
     runtime::Builder,
     time::{
 	sleep,
@@ -41,6 +46,7 @@ use rand::{
     SeedableRng,
     rngs::StdRng,
 };
+use rand_distr::{Zipf, Distribution};
 
 
 fn main() {
@@ -59,19 +65,46 @@ fn main() {
 	.build()
 	.unwrap();
     
-    // TODO: Mudar total para ser parametrizável
     runtime.block_on(async  {
 	let mut rng = StdRng::seed_from_u64(seed as u64);
 	let total_tasks = Arc::new(AtomicUsize::new(total));
-	let mut vm_raw = VM::new(0, num_vcpus, &scheduler, &mapper, Arc::clone(&total_tasks), total)
-	    .await
-	    .expect("Failed to create  VM");
-	    
+	let mut ram = Arc::new(Mutex::new(RAM::new(1048576).expect("Failed to Create RAM")));
+	let mut vm_raw = VM::new(
+	    0,
+	    num_vcpus,
+	    &scheduler,
+	    &mapper,
+	    Arc::clone(&total_tasks),
+	    total,
+	    Arc::clone(&ram)
+	).await.expect("Failed to create VM");	    
 	debug!("Initiating... {:?}", thread::current().id());
-
+	
+	let zipf = Zipf::new(1_000_000, 1.0).unwrap();
+	let base = 0x0000_4000_0000;
+	let page_size = 4096;
 	for i in 0..total {
-	    // TODO: Os workloads das tarefas (idealmente) devem seguir uma distribuição
-	    vm_raw.vm_task_ready_add(Task::new(i as u8, "foo", rng.gen_range(600..=1200))).await;
+	    let workload_size = rng.gen_range(2000..=6000);
+	    // let workload_size = 900;
+
+	    // TODO: The addresses will, ideally, come from a file (read in args.rs)
+	    //       If no file is read, then we generate it (ideally, following a distribution)
+	    // let addresses: Vec<Addr> = (0..workload_size)
+	    // 	.map(|_| Addr::new(rng.r#gen())) // For some reason, .gen() was conflicting with something (?)
+	    // 	.collect();
+	    let addresses: Vec<Addr> = (0..workload_size)
+		.map(|_| {
+		    let page_index = zipf.sample(&mut rng) as u64;
+		    Addr::new(base + page_index * page_size)
+		})
+		.collect();
+	    vm_raw.vm_task_ready_add(
+		Task::new(i as u8,
+			  Arc::clone(&ram),
+			  "foo",
+			  workload_size,
+			  addresses).await
+	    ).await;
 	}
 	let start = Instant::now();
 	let mut vm = Arc::new(vm_raw);
@@ -106,6 +139,19 @@ fn main() {
 	completion_thread.join().unwrap();
 	let elapsed = start.elapsed();
 	let contention = vm.contention_time_nanos.load(Ordering::Relaxed);
-	println!("{:?},{:?},{:.4}", elapsed, contention, (contention as f64 / elapsed.as_nanos() as f64) * 100.0);
+	let schedule_time = vm.schedule_time.load(Ordering::Relaxed);
+	println!("{:?},{:?},{:?},{:.4}", elapsed, contention, schedule_time, (contention as f64 / elapsed.as_nanos() as f64) * 100.0);
+	let finished = vm.vm_tasks_finished.lock().await;
+	for task in finished.iter() {
+	    println!("Task {} - Response time: {:?}, Waiting time: {:?}, Execution Time: {:?}",
+		     task.task_ts_id(),
+		     task.first_response_time.unwrap_or_default(),
+		     task.accumulated_wait_time,
+		     task.accumulated_exec_time,
+	    );
+	}
+
+	vm.print_cache_stats().await;
+	
     });
 }

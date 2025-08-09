@@ -14,6 +14,7 @@ pub struct Args{
     scheduler: String,
     /// This defines which mapper VM's will be using
     mapper: String,
+    ///
 
     seed: usize,
 }
@@ -22,13 +23,13 @@ pub struct Args{
 // Implementation
 //==================================================================================================
 impl Args {
-    const OPT_HELP: &'static str = "-help";
-    const OPT_NUM_VMS: &'static str = "-num_vms";
-    const OPT_NUM_VCPUS: &'static str = "-num_vcpus";
-    const OPT_NUM_TASKS: &'static str = "-num_tasks";
-    const OPT_SCHEDULER: &'static str = "-scheduler";
-    const OPT_MAPPER: &'static str = "-mapper";
-    const OPT_SEED: &'static str = "-seed";
+    const OPT_HELP: &'static str = "--help";
+    const OPT_NUM_VMS: &'static str = "--num_vms";
+    const OPT_NUM_VCPUS: &'static str = "--num_vcpus";
+    const OPT_NUM_TASKS: &'static str = "--num_tasks";
+    const OPT_SCHEDULER: &'static str = "--scheduler";
+    const OPT_MAPPER: &'static str = "--mapper";
+    const OPT_SEED: &'static str = "--seed";
 
     pub fn parse(args: Vec<String>) -> Result<Self> {
 	let mut num_vms: usize = 1;
@@ -89,12 +90,13 @@ impl Args {
 
     pub fn usage(program_name: &str) {
 	println!(
-	    "Usage: {} [{} <num_vms> {} <num_vcpus> {} <['FIFO', 'RoundRobin']> {} <['FIFO']>]",
+	    "Usage: {} [{} <num_vms> {} <num_vcpus> {} <['FIFO', 'RoundRobin']> {} <['FIFO']> {} <seed>]",
 	    program_name,
 	    Self::OPT_NUM_VMS,
 	    Self::OPT_NUM_VCPUS,
 	    Self::OPT_SCHEDULER,
 	    Self::OPT_MAPPER,
+	    Self::OPT_SEED,
 	);
     }
 	

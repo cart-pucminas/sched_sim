@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow   = { workspace = true				}
-task_lib = { path = "../task_lib"			}
-log      = { workspace = true				}
-tokio    = { workspace = true, features = ["full"]	}
+anyhow		= { workspace = true				}
+task_lib	= { path = "../task_lib"			}
+cache_lib	= { path = "../cache_lib"			}
+ram_lib	        = { path = "../ram_lib"  			}	
+mmu_lib 	= { path = "../mmu_lib" 			}	
+log		= { workspace = true				}
+tokio		= { workspace = true, features = ["full"]	}

@@ -1,11 +1,10 @@
 [package]
-name = "task_lib"
+name = "mmu_lib"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow  = { workspace = true				}
 log	= { workspace = true				}
-mem_lib = { path = "../mem_lib"				}
 ram_lib = { path = "../ram_lib"				}
-tokio   = { workspace = true, features = ["full"]	}	
+tokio	= { workspace = true, features = ["full"]	}	

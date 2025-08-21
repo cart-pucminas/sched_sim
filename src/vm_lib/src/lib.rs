@@ -55,7 +55,9 @@ enum Scheduler {
 	current: usize,
     },
     Jaccard {},
-    CDF {},
+    CDF {
+	tol: f64,
+    },
     Balanced {},
     GraphBased {},
     
@@ -92,13 +94,13 @@ pub struct VM
     /// VCPU's senders (mpsc) (private field)
     vcpu_senders		: Arc<Vec<mpsc::Sender<TaskMessage>>>,
     /// List of finished `Task`s inside the `VM` (private field)
-    pub vm_tasks_finished		: Arc<Mutex<VecDeque<Task>>>, // This one might not be needed to be ArcMutex
+    pub vm_tasks_finished	: Arc<Mutex<VecDeque<Task>>>,
     /// List of ready `Task`s inside the `VM` (private field)
     vm_tasks_ready		: Arc<Mutex<VecDeque<Task>>>,
     /// List of running `Task`s inside the `VM` (private field)
     vm_tasks_running		: Arc<Mutex<VecDeque<Task>>>,
     /// `VM`'s Task-vCPU Scheduler (private field)
-    scheduler			: Arc<Mutex<Scheduler>>,
+    scheduler			: Arc<Mutex<Scheduler>>, // Not sure if Arc<Mutex<>> is really necessary
     /// `VM`'s Task-vCPU Mapper (private field)
     mapper			: Arc<Mutex<Mapper>>,
     /// `VM`'s Quantum, if preemptive (private field)
@@ -108,7 +110,10 @@ pub struct VM
 
     ram                         : Arc<Mutex<RAM>>,
 
-    pub vcpu_groups             : HashMap<usize, Vec<usize>>,
+    pub tasks_per_group         : Arc<Mutex<HashMap<usize, Vec<usize>>>>,
+    pub vcpus_per_group         : HashMap<usize, Vec<usize>>,
+    pub vcpus_workload          : Arc<Mutex<Vec<u64>>>,
+    pub group_hotness_agg       : Arc<Mutex<HashMap<usize, HashMap<usize, u64>>>>,
 
     pub task_conflict_dag       : Arc<Mutex<HashMap<usize, HashMap<usize, f64>>>>,
 }
@@ -146,61 +151,70 @@ impl Scheduler {
 	    },
 	    Scheduler::Jaccard { } => {
 
-		// TODO: Remember to change "recent" size (in Task) to Quantum's Size
-		//                                                  (Or some percentage or Quantum's size)
 		let recent = task.get_hotness_recent();
-		let global = task.get_hotness_global();
+		// let previous = task.get_hotness_previous();
 
-		if !Self::hotness_drift_significant(global, &recent, 0.2) {
-		    let selected = task.task_get_last_vcpu_id();
+		// if !Self::hotness_drift_significant(&previous, &recent, 0.8) {
+		//     let selected = task.task_get_last_vcpu_id();
 
-		    debug!(
-			"[VM {}] Selected vCPU ({}) - Jaccard ({:?})",
-			vm.clone().vm_get_id(),
-			selected,
-			thread::current().id(),
-		    );
+		//     debug!(
+		// 	"[VM {}] Selected vCPU ({}) - Jaccard ({:?})",
+		// 	vm.clone().vm_get_id(),
+		// 	selected,
+		// 	thread::current().id(),
+		//     );
 		    
-		    task.task_set_current_vcpu_id(selected);
-		    return selected;
-		}
+		//     task.task_set_current_vcpu_id(selected);
+		//     return selected;
+		// }
+
+		let mut group_hotness_sets: HashMap<usize, HashSet<usize>> = HashMap::new();
 		
-		let task_indices: HashSet<usize> = recent.keys().copied().collect();
-		let group_indices = vm.get_hot_indices_by_group().await;
+		for &group_id in vm.vcpus_per_group.keys() {
+		    let hotness = vm.group_task_hotness(group_id).await;
+		    let hot_indices: HashSet<usize> = hotness.keys().copied().collect();
+		    group_hotness_sets.insert(group_id, hot_indices);
+		}
 
-		// If there is any group that doesn't have tasks in it, we select that group
-		// Otherwise, the selection is based in the distance of jaccard index, i.e.,
-		// the group that the Tasks in it has the least cache conflict with the task to be Scheduled
-		let selected_group_id = if let Some((group_id, _)) = vm.vcpu_groups.iter()
-		    .find(|(group_id, _)| !group_indices.contains_key(group_id))
-		{
-		    *group_id
-		} else {
-		    let mut best_group = None;
-		    let mut best_distance = f64::INFINITY;
 
-		    for (group_id, indices) in group_indices.iter() {
-			let distance = 1.0 - Self::jaccard_index(&task_indices, indices);
-			if distance < best_distance {
-			    best_distance = distance;
-			    best_group = Some(*group_id);
-			}
-		    }
-
-		    best_group.expect("Schedule::Jaccard -> No group found.")
-		};
-
-		let group = &vm.vcpu_groups[&selected_group_id];
-		let group_vcpus: HashSet<usize> = group.iter().copied().collect();
-		let vcpu_task_counts = vm.get_task_count_per_vcpu_group(&group_vcpus).await;
-
-		let selected = group
-		    .iter()
-		    .min_by_key(|vcpu_id| {
-			*vcpu_task_counts.get(vcpu_id).unwrap_or(&0)
+		let task_indices: HashSet<usize> = task.get_hotness_recent().keys().copied().collect();
+		let mut group_distances: Vec<(usize, f64)> = vm.vcpus_per_group.keys()
+		    .map(|&gid| {
+			let dist = 1.0 - Self::jaccard_index(&task_indices, &group_hotness_sets[&gid]);
+			(gid, dist)
 		    })
+		    .collect();
+
+		// In case that there are 2 or more groups that are tied with the maximum distance
+		// we must choose the group that has the least number of tasks currently
+		// this ensures workload balancement
+		// The way that it is done here, if a group has no tasks, it will select it as the best
+		// this also ensures workload balancement, even more, it streamlines task's accesses
+		let max_distance = group_distances.iter()
+		    .map(|(_, d)| *d)
+		    .fold(f64::MIN, f64::max);
+		let candidate_groups: Vec<usize> = group_distances.iter()
+		    .filter(|(_, d)| (*d - max_distance).abs() < f64::EPSILON)
+		    .map(|(gid, _)| *gid)
+		    .collect();
+		
+		let tasks_per_group = vm.tasks_per_group.lock().await;
+		let best_group = candidate_groups.into_iter()
+		    .min_by_key(|gid| tasks_per_group.get(gid)
+				.map(|v| v.len())
+				.unwrap_or(0))
+		    .unwrap();
+		drop(tasks_per_group);
+
+		// After finding the "best_group"
+		let workloads = vm.vcpus_workload.lock().await;
+		let selected = vm.vcpus_per_group.get(&best_group)
+		    .expect("Schedule::Jaccard -> Best group to select vCPU.")
+		    .iter()
+		    .min_by_key(|&&vcpu_id| workloads[vcpu_id])
 		    .copied()
-		    .expect("Scheduler::Jaccard -> Expected to find a vCPU id");
+		    .expect("Schedule::Jaccard -> At least one vCPU in best group");
+		drop(workloads);
 
 		task.task_set_current_vcpu_id(selected);
 		debug!(
@@ -209,13 +223,14 @@ impl Scheduler {
 		    selected,
 		    thread::current().id(),
 		);
+
 		selected
 	    },
-	    Scheduler::CDF { } => {
+	    Scheduler::CDF { tol } => {
 		let recent = task.get_hotness_recent();
-		let global = task.get_hotness_global();
+		let previous = task.get_hotness_previous();
 
-		if !Self::hotness_drift_significant(global, &recent, 0.2) {
+		if !Self::hotness_drift_significant(&previous, &recent, 0.8) {
 		    let selected = task.task_get_last_vcpu_id();
 
 		    debug!(
@@ -229,256 +244,293 @@ impl Scheduler {
 		    return selected;
 		}
 
-		let task_cdf = Self::compute_cdf(&recent);
-		let task_percentiles = Self::extract_percentiles(&task_cdf, &[0.25, 0.5, 0.75]);
+		let task_p = Self::percentiles3_from_hotness(&recent);
 
-		let group_indices = vm.get_hot_indices_by_group().await;
-
-		let mut good_groups = Vec::new();
-		let tol = 0.2;
-
-		for (group_id, hotness_values) in group_indices.iter() {
-		    if hotness_values.is_empty() {
-			good_groups.push(*group_id);
-			continue;
-		    }
-
-		    let group_cdf = Self::compute_cdf_from_values(
-			&hotness_values.iter().map(|&x| x as u64).collect::<Vec<_>>()
-		    );
-
-		    if group_cdf.is_empty() {
-			good_groups.push(*group_id);
-			continue;
-		    }
-		    
-		    let group_percentiles = Self::extract_percentiles(&group_cdf, &[0.25, 0.5, 0.75]);
-
-		    let mut valid_count = 0;
-		    for i in 0..task_percentiles.len() {
-			let lower = group_percentiles[i] * (1.0 - tol);
-			let upper = group_percentiles[i] * (1.0 + tol);
-			if task_percentiles[i] >= lower && task_percentiles[i] <= upper {
-			    valid_count += 1;
-			}
-		    }
-
-		    if valid_count >= 2 {
-			good_groups.push(*group_id);
-		    }
-		}
-
-		let candidate_groups: Vec<usize> = if !good_groups.is_empty() {
-		    good_groups.iter().copied().collect()
-		} else {
-		    vm.vcpu_groups.keys().copied().collect()
+		let agg_snapshot: HashMap<usize, HashMap<usize, u64>> = {
+		    let agg = vm.group_hotness_agg.lock().await;
+		    agg.clone()
 		};
 
-		let mut group_loads: Vec<(usize, usize)> = Vec::with_capacity(candidate_groups.len());
-		for gid in candidate_groups.into_iter() {
-		    let vcpus: HashSet<usize> = vm.vcpu_groups.get(&gid)
-			.expect("group id must exist")
-			.iter()
-			.copied()
-			.collect();
-
-		    let counts_map = vm.get_task_count_per_vcpu_group(&vcpus).await;
-		    let load: usize = counts_map.values().sum();
-		    group_loads.push((gid, load));
-			
+		let mut group_valid_counts: HashMap<usize, usize> = HashMap::with_capacity(agg_snapshot.len());
+		for (&gid, group_map) in agg_snapshot.iter() {
+		    if group_map.is_empty() {
+			group_valid_counts.insert(gid, 3);
+		    } else {
+			let gp = Self::percentiles3_from_hotness(group_map);
+			let vc = Self::percentile_valid_count(task_p, gp, *tol);
+			group_valid_counts.insert(gid, vc);
+		    }
 		}
 
-		let (selected_group_id, _) = group_loads
-		    .into_iter()
-		    .min_by_key(|(_, load)| *load)			
-		    .expect("Schedule::CDF ther must be atleast one candidate group");
+		let max_valid = group_valid_counts.values().copied().max().unwrap_or(0);
 
-		let selected_vcpus_slice = &vm.vcpu_groups[&selected_group_id];
-		let group_vcpus: HashSet<usize> = selected_vcpus_slice.iter().copied().collect();
-		let vcpu_task_count = vm.get_task_count_per_vcpu_group(&group_vcpus).await;
-		
+		let tasks_per_group_len: HashMap<usize, usize> = {
+		    let tpg = vm.tasks_per_group.lock().await;
+		    tpg.iter().map(|(&g, v)| (g, v.len())).collect()
+		};
 
-		let selected = selected_vcpus_slice
-		    .iter()
-		    .min_by_key(|vcpu_id| {
-			vcpu_task_count.get(vcpu_id).copied().unwrap_or(0)
-		    })
-		    .copied()
-		    .expect("Scheduler::CDF -> Expected to find a vCPU id");
+		let mut best_group = None;
+		let mut best_len = usize::MAX;
+		for (&gid, &count) in group_valid_counts.iter() {
+		    if count == max_valid {
+			let len = *tasks_per_group_len.get(&gid).unwrap_or(&0);
+			if len < best_len {
+			    best_len = len;
+			    best_group = Some(gid);
+			}
+		    }
+		}
+		let best_group = best_group.expect("Schedule::CDF -> Best group wasn't found.");
+
+		let selected = {
+		    let workloads = vm.vcpus_workload.lock().await;
+		    vm.vcpus_per_group
+			.get(&best_group)
+			.expect("Schedule::CDF -> Best group to select vCPU")
+			.iter()
+			.copied()
+			.min_by_key(|&vcpu_id| workloads[vcpu_id])
+			.expect("Schedule::CDF -> At least one vCPU in 'best group'.")
+		};
 
 		task.task_set_current_vcpu_id(selected);
-
 		debug!(
 		    "[VM {}] Selected vCPU ({}) - CDF ({:?})",
 		    vm.clone().vm_get_id(),
 		    selected,
 		    thread::current().id(),
 		);
-
 		selected
+		// let task_cdf = Self::compute_cdf(&recent);
+		// let task_percentiles: Vec<usize> = Self::extract_percentiles(&task_cdf, &[0.25, 0.5, 0.75]);
+
+		// let mut group_valid_counts: HashMap<usize, usize> = HashMap::new();
+		// let tolerance = tol;
+
+		// for &group_id in vm.vcpus_per_group.keys() {
+		//     let group_hotness = vm.group_task_hotness(group_id).await;
+
+		//     if group_hotness.is_empty() {
+		// 	group_valid_counts.insert(group_id, 3);
+		// 	continue;
+		//     }
+
+		//     let group_cdf = Self::compute_cdf(&group_hotness);
+		//     let group_percentiles: Vec<usize> = Self::extract_percentiles(&group_cdf, &[0.25, 0.5, 0.75]);
+
+		//     let mut valid_count = 0;		    
+		//     for i in 0..task_percentiles.len() {
+			
+		// 	// if group_percentiles[i] == 0.0 {
+		// 	//     if task_percentiles[i] == 0.0 { valid_count += 1; }
+		// 	//     continue;
+		// 	// }
+			
+		// 	let dist = (group_percentiles[i] as f64) * *tolerance;
+		// 	let lower = (group_percentiles[i] as f64) + dist;
+		// 	let upper = (group_percentiles[i] as f64) - dist;
+		// 	if (task_percentiles[i] as f64) <= lower || (task_percentiles[i] as f64) >= upper {
+		// 	    valid_count += 1;
+		// 	}
+		//     }
+
+		//     group_valid_counts.insert(group_id, valid_count);
+		// }
+
+
+		// let max_valid = group_valid_counts.values()
+		//     .copied()
+		//     .max()
+		//     .unwrap_or(0);
+		// let candidate_groups: Vec<usize> = group_valid_counts
+		//     .iter()
+		//     .filter(|&(_, &count)| count == max_valid)
+		//     .map(|(&gid, _)| gid)
+		//     .collect();
+
+		// let tasks_per_group = vm.tasks_per_group.lock().await;
+		// // As done in Jaccard, the tie-breaking will be the group with least amount of tasks
+		// let best_group = candidate_groups
+		//     .into_iter()
+		//     .min_by_key(|gid| tasks_per_group.get(gid).map(|v| v.len()).unwrap_or(0))
+		//     .expect("Schedule::CDF -> Best group wasn't found.");
+		// drop(tasks_per_group);
+		
+		// let workloads = vm.vcpus_workload.lock().await;
+		// let selected = vm.vcpus_per_group
+		//     .get(&best_group)
+		//     .expect("Schedule::CDF -> Best group to select vCPU")
+		//     .iter()
+		//     .min_by_key(|&&vcpu_id| workloads[vcpu_id])
+		//     .copied()
+		//     .expect("Schedule::CDF -> At least one vCPU in 'best group'.");
+		// drop(workloads);
 		    
-			  
+		// task.task_set_current_vcpu_id(selected);
+
+		// debug!(
+		//     "[VM {}] Selected vCPU ({}) - CDF ({:?})",
+		//     vm.clone().vm_get_id(),
+		//     selected,
+		//     thread::current().id(),
+		// );
+
+		// selected
+		
 	    },
 	    Scheduler::GraphBased { } => {
 
-		let recent = task.get_hotness_recent();
-		let global = task.get_hotness_global();
+		// let recent = task.get_hotness_recent();
+		// let global = task.get_hotness_global();
 
-		if !Self::hotness_drift_significant(global, &recent, 0.2) {
-		    let selected = task.task_get_last_vcpu_id();
+		// if !Self::hotness_drift_significant(global, &recent, 0.2) {
+		//     let selected = task.task_get_last_vcpu_id();
 
-		    debug!(
-			"[VM {}] Selected vCPU ({}) - Graph ({:?})",
-			vm.clone().vm_get_id(),
-			selected,
-			thread::current().id(),
-		    );
+		//     debug!(
+		// 	"[VM {}] Selected vCPU ({}) - Graph ({:?})",
+		// 	vm.clone().vm_get_id(),
+		// 	selected,
+		// 	thread::current().id(),
+		//     );
 		    
-		    task.task_set_current_vcpu_id(selected);
-		    return selected;
-		}
+		//     task.task_set_current_vcpu_id(selected);
+		//     return selected;
+		// }
 
-		let task_id = task.ts_id;
+		// let task_id = task.ts_id;
 
-		let mut dag = vm.task_conflict_dag.lock().await;
-		let mut tasks_map = HashMap::new();
+		// let mut dag = vm.task_conflict_dag.lock().await;
+		// let mut tasks_map = HashMap::new();
 
-		let running_tasks = vm.vm_tasks_running.lock().await;
+		// let running_tasks = vm.vm_tasks_running.lock().await;
 
-		// Adding task to DAG and getting weights
-		// weights = frequence(a) * frequence(b) if key(a) == key(b)
-		for t in running_tasks.iter() {
-		    if t.ts_id == task_id {
-			continue;
-		    }
+		// // Adding task to DAG and getting weights
+		// // weights = frequence(a) * frequence(b) if key(a) == key(b)
+		// for t in running_tasks.iter() {
+		//     if t.ts_id == task_id {
+		// 	continue;
+		//     }
 
-		    let weight = Self::conflict_weight(&task, t);
-		    if weight > 0.0 {
-			tasks_map.insert(t.ts_id as usize, weight);
-			dag.entry(t.ts_id.into()).or_default().insert(task_id.into(), weight);
-		    }
-		}
-		dag.insert(task_id.into(), tasks_map);
+		//     let weight = Self::conflict_weight(&task, t);
+		//     if weight > 0.0 {
+		// 	tasks_map.insert(t.ts_id as usize, weight);
+		// 	dag.entry(t.ts_id.into()).or_default().insert(task_id.into(), weight);
+		//     }
+		// }
+		// dag.insert(task_id.into(), tasks_map);
 
-		let mut group_conflicts: HashMap<usize, f64> = HashMap::new();
+		// let mut group_conflicts: HashMap<usize, f64> = HashMap::new();
 
-		// For each grup, we get the amount of accum. conflict with the tasks
-		// currently running in that group.
-		for (&group_id, vcpus) in &vm.vcpu_groups {
-		    let mut total_conflict = 0.0;
-		    for t in running_tasks.iter() {
-			if t.ts_id == task_id { continue }
-			let vcpu_id = t.task_get_current_vcpu_id();
+		// // For each grup, we get the amount of accum. conflict with the tasks
+		// // currently running in that group.
+		// for (&group_id, vcpus) in &vm.vcpu_groups {
+		//     let mut total_conflict = 0.0;
+		//     for t in running_tasks.iter() {
+		// 	if t.ts_id == task_id { continue }
+		// 	let vcpu_id = t.task_get_current_vcpu_id();
 
-			// Identifies if vCPU is in current group
-			if vcpus.contains(&vcpu_id) {
+		// 	// Identifies if vCPU is in current group
+		// 	if vcpus.contains(&vcpu_id) {
 
-			    // If conflict found, sum it up
-			    if let Some(conflicts) = dag.get(&task_id.into()) {
-				total_conflict += conflicts.get(&t.ts_id.into()).copied().unwrap_or(0.0);
-			    }
+		// 	    // If conflict found, sum it up
+		// 	    if let Some(conflicts) = dag.get(&task_id.into()) {
+		// 		total_conflict += conflicts.get(&t.ts_id.into()).copied().unwrap_or(0.0);
+		// 	    }
 			    
-			}
-		    }
+		// 	}
+		//     }
 		    
-		    group_conflicts.insert(group_id, total_conflict);
-		}
-		drop(running_tasks);
+		//     group_conflicts.insert(group_id, total_conflict);
+		// }
+		// drop(running_tasks);
 
-		// Choosing all groups with the least amount of accum. conflict
-		let min_conflict = group_conflicts.values().copied().fold(f64::INFINITY, f64::min);
-		let candidate_groups: Vec<usize> = group_conflicts.iter()
-		    .filter_map(|(&gid, &conflict)|
-				if conflict == min_conflict {
-				    Some(gid)
-				}
-				else {
-				    None
-				}
-		    ).collect();
+		// // Choosing all groups with the least amount of accum. conflict
+		// let min_conflict = group_conflicts.values().copied().fold(f64::INFINITY, f64::min);
+		// let candidate_groups: Vec<usize> = group_conflicts.iter()
+		//     .filter_map(|(&gid, &conflict)|
+		// 		if conflict == min_conflict {
+		// 		    Some(gid)
+		// 		}
+		// 		else {
+		// 		    None
+		// 		}
+		//     ).collect();
 
-		// If necessary, breaking the tie selecting the group with the least amount of workload
-		let mut group_loads: Vec<(usize, usize)> = Vec::with_capacity(candidate_groups.len());
-		for gid in candidate_groups.into_iter() {
-		    let vcpus: HashSet<usize> = vm.vcpu_groups.get(&gid)
-			.expect("group id must exist")
-			.iter()
-			.copied()
-			.collect();
+		// // If necessary, breaking the tie selecting the group with the least amount of workload
+		// let mut group_loads: Vec<(usize, usize)> = Vec::with_capacity(candidate_groups.len());
+		// for gid in candidate_groups.into_iter() {
+		//     let vcpus: HashSet<usize> = vm.vcpu_groups.get(&gid)
+		// 	.expect("group id must exist")
+		// 	.iter()
+		// 	.copied()
+		// 	.collect();
 
-		    let counts_map = vm.get_task_count_per_vcpu_group(&vcpus).await;
-		    let load: usize = counts_map.values().sum();
-		    group_loads.push((gid, load));
+		//     let counts_map = vm.get_task_count_per_vcpu_group(&vcpus).await;
+		//     let load: usize = counts_map.values().sum();
+		//     group_loads.push((gid, load));
 			
-		}
+		// }
 		
-		let (selected_group_id, _) = group_loads
-		    .into_iter()
-		    .min_by_key(|(_, load)| *load)
-		    .expect("Schedule::GraphBased -> Expected at least one candidate group");
+		// let (selected_group_id, _) = group_loads
+		//     .into_iter()
+		//     .min_by_key(|(_, load)| *load)
+		//     .expect("Schedule::GraphBased -> Expected at least one candidate group");
 
 
-		let selected_vcpus_slice = &vm.vcpu_groups[&selected_group_id];
-		let group_vcpus: HashSet<usize> = selected_vcpus_slice.iter().copied().collect();
-		let vcpu_task_count = vm.get_task_count_per_vcpu_group(&group_vcpus).await;
+		// let selected_vcpus_slice = &vm.vcpu_groups[&selected_group_id];
+		// let group_vcpus: HashSet<usize> = selected_vcpus_slice.iter().copied().collect();
+		// let vcpu_task_count = vm.get_task_count_per_vcpu_group(&group_vcpus).await;
 
-		let selected = selected_vcpus_slice
-		    .iter()
-		    .min_by_key(|vcpu_id| {
-			vcpu_task_count.get(vcpu_id).copied().unwrap_or(0)
-		    })
-		    .copied()
-		    .expect("Scheduler::GraphBased -> Expected to find a vCPU id");
+		// let selected = selected_vcpus_slice
+		//     .iter()
+		//     .min_by_key(|vcpu_id| {
+		// 	vcpu_task_count.get(vcpu_id).copied().unwrap_or(0)
+		//     })
+		//     .copied()
+		//     .expect("Scheduler::GraphBased -> Expected to find a vCPU id");
 
-		task.task_set_current_vcpu_id(selected);
+		// task.task_set_current_vcpu_id(selected);
 		
-		debug!(
-		    "[VM {}] Selected vCPU ({}) - Graph ({:?})",
-		    vm.clone().vm_get_id(),
-		    selected,
-		    thread::current().id(),
-		);
+		// debug!(
+		//     "[VM {}] Selected vCPU ({}) - Graph ({:?})",
+		//     vm.clone().vm_get_id(),
+		//     selected,
+		//     thread::current().id(),
+		// );
 
-		selected
-		
+		// selected
+		0
 	    }
 	    Scheduler::Balanced { } => {
-		let tasks_running = vm.vm_tasks_running.lock().await;
-		let cache_groups = &vm.vcpu_groups;
-
-		let mut group_loads: HashMap<usize, usize> = HashMap::new();
-
-		for (group_id, vcpus) in cache_groups.iter() {
-		    let mut total = 0;
-		    for vcpu_id in vcpus {
-			let count = tasks_running
-			    .iter()
-			    .filter(|t| t.task_get_current_vcpu_id() == *vcpu_id)
-			    .count();
-			total += count;
-		    }
-		    group_loads.insert(*group_id, total);
-		}
-
-
-		let (&best_group_id, _) = group_loads.iter().min_by_key(|(_, load)| *load).unwrap();
+		let tasks_per_group = vm.tasks_per_group.lock().await;
+		let (&best_group_id, _) = tasks_per_group
+		    .iter()
+		    .min_by_key(|(_, tasks)| tasks.len())
+		    .expect("Schedule::Balanced => No NUMA-groups found.");
+		drop(tasks_per_group);
 
 		let mut best_vcpu = None;
-		let mut min_tasks = usize::MAX;
-
-		for &vcpu_id in &cache_groups[&best_group_id] {
-		    let count = tasks_running
-			.iter()
-			.filter(|t| t.task_get_current_vcpu_id() == vcpu_id)
-			.count();
-		    if count < min_tasks {
-			best_vcpu = Some(vcpu_id);
-			min_tasks = count;
+		let mut min_workload = u64::MAX;
+		
+		let vcpus_per_group = &vm.vcpus_per_group;
+		let vcpus_workload = vm.vcpus_workload.lock().await;
+		if let Some(vcpus) = vcpus_per_group.get(&best_group_id) {
+		    for &vcpu_id in vcpus {
+			if let Some(&load) = vcpus_workload.get(vcpu_id) {
+			    if load < min_workload {
+				min_workload = load;
+				best_vcpu = Some(vcpu_id);
+			    }
+			}
 		    }
 		}
+
+		drop(vcpus_per_group);
+		drop(vcpus_workload);
+		
 		let selected = best_vcpu.expect("Schedule::Balanced => No vCPU selected. ERROR");
 		debug!(
-		    "[VM {}] Selected vCPU ({}) - Jaccard ({:?})",
+		    "[VM {}] Selected vCPU ({}) - Balanced ({:?})",
 		    vm.clone().vm_get_id(),
 		    selected,
 		    thread::current().id(),
@@ -550,36 +602,60 @@ impl Scheduler {
     }
 
     // CDF FUNCTIONS
-    fn compute_cdf(values: &HashMap<usize, u64>) -> Vec<f64> {
-	let mut vals: Vec<u64> = values.values().copied().collect();
-	vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-	let n = vals.len();
-	vals.into_iter()
-	    .enumerate()
-	    .map(|(i, v)| (i + 1) as f64 / n as f64)
-	    .collect()
+    #[inline]
+    fn percentiles3_from_hotness(h: &HashMap<usize, u64>) -> [usize; 3] {
+	if h.is_empty() {
+	    return [0; 3]
+	}
+
+	let mut items: Vec<(usize, u64)> = Vec::with_capacity(h.len());
+	items.extend(h.iter().map(|(&idx, &cnt)| (idx, cnt)));
+	items.sort_unstable_by_key(|&(idx, _)| idx);
+
+	let total: u128 = items.iter().map(|&(_, c)| c as u128).sum();
+	if total == 0 {
+	    let first = items[0].0;
+	    return [first, first, first];
+	}
+
+	let t25 = (total as f64 * 0.25).ceil() as u128;
+	let t50 = (total as f64 * 0.50).ceil() as u128;
+	let t75 = (total as f64 * 0.75).ceil() as u128;
+
+	let mut cumul: u128 = 0;
+	let mut p25 = None;
+	let mut p50 = None;
+	let mut p75 = None;
+
+	for (idx, cnt) in items {
+	    cumul += cnt as u128;
+	    if p25.is_none() && cumul >= t25 { p25 = Some(idx); }
+	    if p50.is_none() && cumul >= t50 { p50 = Some(idx); }
+	    if p75.is_none() && cumul >= t75 { p75 = Some(idx); }
+	    if p25.is_some() && p50.is_some() && p75.is_some() { break; }
+	}
+
+	[
+	    p25.unwrap_or(0),
+	    p50.unwrap_or(0),
+	    p75.unwrap_or(0),
+	]
 	
     }
-    
-    fn compute_cdf_from_values(values: &[u64]) -> Vec<f64> {
-	let mut vals: Vec<u64> = values.to_vec();
-	vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-	let n = vals.len();
-	vals.into_iter()
-	    .enumerate()
-	    .map(|(i, v)| (i + 1) as f64 / n as f64)
-	    .collect()	
-    }
 
-    fn extract_percentiles(cdf: &[f64], percentiles: &[f64]) -> Vec<f64> {
-	if cdf.is_empty() {
-	    return Vec::new();
+    #[inline]
+    fn percentile_valid_count(task_p: [usize; 3], group_p: [usize; 3], tol: f64) -> usize {
+	let mut count = 0usize;
+	for i in 0..3 {
+	    let g = group_p[i] as f64;
+	    let t = task_p[i] as f64;
+	    let band = tol * g.max(1.0);
+	    if (t - g).abs() > band {
+		count += 1;
+	    }
 	}
-	percentiles.iter().map(|&p| {
-	    let idx = ((cdf.len() as f64) * p).ceil() as usize;
-	    let idx = idx.saturating_sub(1);
-	    cdf[idx.min(cdf.len() - 1)]
-	}).collect()
+
+	count
     }
     
     // GraphBased functions
@@ -653,6 +729,7 @@ impl VM
 	desired_mapper: &str,
 	num_tasks: Arc<AtomicUsize>,
 	max_num_tasks: usize,
+	cdf_tol: f64,
 	ram: Arc<Mutex<RAM>>,
     ) -> Result<Self> {
 	debug!(
@@ -671,7 +748,7 @@ impl VM
 		Arc::new(Mutex::new(Scheduler::Jaccard { } ))
 	    },
 	    "CDF" => {
-		Arc::new(Mutex::new(Scheduler::CDF { } ))
+		Arc::new(Mutex::new(Scheduler::CDF { tol: cdf_tol } ))
 	    }
 	    "Balanced" => {
 		Arc::new(Mutex::new(Scheduler::Balanced { } ))
@@ -708,6 +785,11 @@ impl VM
 
 	let mut l2_groups: Vec<Arc<Mutex<Cache>>> = Vec::new();
 	let num_l2_groups = (num_vcpus + 3) / 4;
+	let mut tasks_per_group: HashMap<usize, Vec<usize>> = HashMap::new();
+	for idx in 0..num_l2_groups {
+	    tasks_per_group.insert(idx, Vec::new());
+	}
+	    
 
 	for g in 0..num_l2_groups {
 	    let l2 = Arc::new(Mutex::new(Cache::new(
@@ -723,6 +805,7 @@ impl VM
 
 	let mut vcpus: Vec<Arc<Mutex<VCPU>>> = Vec::with_capacity(num_vcpus);
 	let mut vcpu_l2_groups = HashMap::new();
+
 	for i in 0..num_vcpus {
 	    let (transmitter, receiver) = mpsc::channel(max_num_tasks);
 	    senders.push(transmitter);
@@ -748,7 +831,8 @@ impl VM
 		vcpu_l1,
 		l2_shared,
 		l3_global,
-		ram.clone()
+		ram.clone(),
+		l2_index.try_into().unwrap()
 	    )?));
 	    let vcpu_clone = Arc::clone(&vcpu);
 
@@ -766,39 +850,91 @@ impl VM
 	    vcpus.push(vcpu);
 	}
 
+	let mut vcpus_workload: Vec<u64> = Vec::with_capacity(num_vcpus);
+
+	for vcpu_i in 0..num_vcpus {
+	    vcpus_workload.push(0);
+	}
+	
+	let mut group_hotness_agg: HashMap<usize, HashMap<usize, u64>> = HashMap::new();
+	for idx in 0..num_l2_groups {
+	    group_hotness_agg.insert(idx, HashMap::new());
+	}
+
 	Ok(Self {
-	       vm_id: id,
-	       vm_vcpus: vcpus,
-	       l2_caches: l2_groups,
-	       l3_cache: l3_shared,
-	       vm_total_task_count: num_tasks,
+	       vm_id			: id,
+	       vm_vcpus			: vcpus,
+	       l2_caches		: l2_groups,
+	       l3_cache			: l3_shared,
+	       vm_total_task_count	: num_tasks,
 	       contention_time_nanos,
 	       schedule_time,
-	       vcpu_senders: Arc::new(senders),
-	       vm_tasks_finished: Arc::new(Mutex::new(VecDeque::new())),
-               vm_tasks_ready: Arc::new(Mutex::new(VecDeque::new())),
-	       vm_tasks_running: Arc::new(Mutex::new(VecDeque::new())),
-	       scheduler: vm_scheduler,
-	       mapper: vm_mapper,
-	       quantum: 300,
+	       vcpu_senders		: Arc::new(senders),
+	       vm_tasks_finished	: Arc::new(Mutex::new(VecDeque::new())),
+               vm_tasks_ready		: Arc::new(Mutex::new(VecDeque::new())),
+	       vm_tasks_running		: Arc::new(Mutex::new(VecDeque::new())),
+	       scheduler		: vm_scheduler,
+	       mapper			: vm_mapper,
+	       quantum			: 300,
 	       preemptive,
 	       ram,
-               vcpu_groups: vcpu_l2_groups,
-	       task_conflict_dag: Arc::new(Mutex::new(HashMap::new())),
+	       tasks_per_group		: Arc::new(Mutex::new(tasks_per_group)),
+               vcpus_per_group		: vcpu_l2_groups,
+	       vcpus_workload           : Arc::new(Mutex::new(vcpus_workload)),
+	       group_hotness_agg        : Arc::new(Mutex::new(group_hotness_agg)),
+	       task_conflict_dag	: Arc::new(Mutex::new(HashMap::new())),
 	})
     }
 
     pub async fn completion_loop(
 	self: Arc<VM>,
-	mut completion_receiver: mpsc::Receiver<(Task, u64)>
+	mut completion_receiver: mpsc::Receiver<(Task, u64, u8)>
     ) {
-	while let Some((mut task, execution_time)) = completion_receiver.recv().await {
+	while let Some((mut task, execution_time, selected_vcpu)) = completion_receiver.recv().await {
+	    let vcpu_group_id = self.vm_vcpus[selected_vcpu as usize].lock().await.vcpu_group_id;
+
 	    let start = Instant::now();
-	    self.vm_tasks_running.lock().await.retain(|t| t.task_ts_id() != task.task_ts_id());
+	    
+	    {
+		let recent_hotness = task.get_hotness_recent().clone();
+		let mut agg = self.group_hotness_agg.lock().await;
+		if let Some(group_map) = agg.get_mut(&(vcpu_group_id as usize)) {
+		    for (idx, cnt) in recent_hotness.iter() {
+			if let Some(value) = group_map.get_mut(idx) {
+			    if *value > *cnt {
+				*value -= *cnt;
+			    } else {
+				group_map.remove(idx);
+			    }
+			}
+		    }
+		}
+		
+		
+	    }
+
+	    // Removing task from running map	    
+	    let mut running = self.vm_tasks_running.lock().await;
+	    running.remove(task.task_ts_id() as usize);
+	    drop(running);
+	    
+	    // Updating vCPU workload
+	    let mut vcpus_workload = self.vcpus_workload.lock().await;
+	    vcpus_workload[selected_vcpu as usize] -= task.task_current_exectime();
+	    drop(vcpus_workload);
+
+	    // Removing task from group
+	    let mut tpg = self.tasks_per_group.lock().await;
+	    if let Some(vec) = tpg.get_mut(&(vcpu_group_id as usize)) {
+		if let Some(pos) = vec.iter().rposition(|&x| x == task.task_ts_id() as usize) {
+		    vec.swap_remove(pos);
+		}
+	    }
+	    
 	    self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
+
 	    
 	    task.task_process_workload(execution_time);
-
 	    // This might not be as accurate, probably might change in the future to the real time spent
 	    task.accumulated_exec_time += Duration::from_nanos(execution_time);
 	    
@@ -820,7 +956,7 @@ impl VM
     
     pub async fn schedule_loop(
 	self: Arc<VM>,
-	completion_sender: mpsc::Sender<(Task, u64)>
+	completion_sender: mpsc::Sender<(Task, u64, u8)>
     ) {
 	loop {
 
@@ -837,8 +973,7 @@ impl VM
 
 		// Setting Task's time metrics
 		if task.start_time.is_none() {
-		    let now = Instant::now();
-		    task.start_time = Some(now);
+		    task.start_time = Some(Instant::now());
 		}
 
 		let start = Instant::now();
@@ -853,26 +988,96 @@ impl VM
 		}
 
 		task.task_set_current_exectime(execution_time);
-		
+
 		let start = Instant::now();
-		self.vm_tasks_running.lock().await.push_back(task.clone());
-		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
-
+		let vcpu_group_id = self.vm_vcpus[selected_vcpu as usize].lock().await.vcpu_group_id;
 		
+		self.vm_tasks_running.lock()
+		    .await
+		    .push_back(task.clone());
+		
+		self.tasks_per_group.lock()
+		    .await
+		    .entry(vcpu_group_id as usize)
+		    .or_default()
+		    .push(task.task_ts_id() as usize);
+		
+		let mut vcpu_wl = self.vcpus_workload.lock().await;
+		vcpu_wl[selected_vcpu as usize] += task.task_current_exectime();
+		drop(vcpu_wl);
 
+		{
+		    let recent_hotness = task.get_hotness_recent().clone();
+		    let mut agg = self.group_hotness_agg.lock().await;
+		    if let Some(group_map) = agg.get_mut(&(vcpu_group_id as usize)) {
+			for (idx, cnt) in recent_hotness.iter() {
+			    *group_map.entry(*idx).or_insert(0) += *cnt;
+			}
+		    } else {
+			// Sanity check
+			agg.insert(vcpu_group_id as usize, recent_hotness);
+		    }
+		}
+		
+		self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
+		
+		
+		
 		let (response_transmitter, response_receiver) = oneshot::channel();
 		if self.vcpu_senders[selected_vcpu].send((task.clone(), response_transmitter)).await.is_ok() {
 		    let completion_sender = completion_sender.clone();
 		    tokio::spawn(async move {
 			if let Ok(returned_task) = response_receiver.await {
-			    let _ = completion_sender.send((returned_task, execution_time)).await;
+			    let _ = completion_sender.send(
+				(returned_task, execution_time, selected_vcpu.try_into().unwrap())
+			    ).await;
 			}
 		    });
 		    
-		    // If failed to send task, readd task to be sent elsewhere
+		    // If failed to send task, re-add task to be sent elsewhere
+		    // and update vCPU workload and group membership
 		} else {
 		    let start = Instant::now();
+		    
+		    {
+			let recent_hotness = task.get_hotness_recent().clone();
+			let mut agg = self.group_hotness_agg.lock().await;
+			if let Some(group_map) = agg.get_mut(&(vcpu_group_id as usize)) {
+			    for (idx, cnt) in recent_hotness.iter() {
+				if let Some(value) = group_map.get_mut(idx) {
+				    if *value > *cnt {
+					*value -= *cnt;
+				    } else {
+					group_map.remove(idx);
+				    }
+				}
+			    }
+			}
+			    
+			    
+		    }
+		    
+		    
+		    let mut vcpu_wl = self.vcpus_workload.lock().await;
+		    vcpu_wl[selected_vcpu as usize] -= task.task_current_exectime();
+		    drop(vcpu_wl);
+
+		    let mut tpg = self.tasks_per_group.lock().await;
+		    if let Some(vec) = tpg.get_mut(&(vcpu_group_id as usize)) {
+			if let Some(pos) = vec.iter().rposition(|&x| x == task.task_ts_id() as usize) {
+			    vec.swap_remove(pos);
+			}
+		    }
+		    drop(tpg);
+
+		    
+		    self.vm_tasks_running.lock()
+			.await
+			.remove(task.task_ts_id() as usize);
+		    
 		    self.vm_tasks_ready.lock().await.push_front(task);
+
+		    
 		    self.contention_time_nanos.fetch_add(start.elapsed().as_nanos() as usize, Ordering::Relaxed);
 		}
 	    } else {
@@ -884,49 +1089,14 @@ impl VM
 	debug!("[VM {}] Finished processing.", self.vm_get_id());
     }
 
-    pub async fn get_hot_indices_by_group(&self) -> HashMap<usize, HashSet<usize>> {
-	let mut group_accesses: HashMap<usize, HashSet<usize>> = HashMap::new();
-
-	// Better to access "vm_task_running", since it only afects the "completion" thread
-	// If we had to access the mpsc of each vCPU, it would generate more overhead
-	let running = self.vm_tasks_running.lock().await;	
-	for task in running.iter() {
-	    let vcpu_id = task.task_get_current_vcpu_id() as usize;
-	    if let Some((group_id, _)) = self.vcpu_groups.iter()
-		.find(|(_, vcpus)| vcpus.contains(&vcpu_id))
-	    {
-		let entry = group_accesses.entry(*group_id).or_default();
-		entry.extend(task.get_hotness_recent().keys().copied());
-	    }
-	}
-
-
-	// TODO: Check if necessary -> Currently, in the way that it is, Jaccard index will bug with this uncommented
-	// // Granting that every group is "filled"
-	for (group_id, _) in self.vcpu_groups.iter() {
-	    group_accesses.entry(*group_id).or_insert_with(HashSet::new);
-	}
-	
-	group_accesses
+    pub async fn group_task_hotness(&self, group_id: usize) -> HashMap<usize, u64> {
+	// Return a cloned snapshot of the aggregated hotness for the group.
+	let agg = self.group_hotness_agg.lock().await;
+	agg.get(&group_id).cloned().unwrap_or_default()
     }
 
-    pub async fn get_task_count_per_vcpu_group(
-	&self,
-	group_vcpus: &HashSet<usize>,
-    ) -> HashMap<usize, usize> {
-	let mut counts = HashMap::new();
-	
-	let running = self.vm_tasks_running.lock().await;
-	for task in running.iter() {
-	    let vcpu_id = task.task_get_current_vcpu_id();
-	    if group_vcpus.contains(&vcpu_id) {
-		*counts.entry(vcpu_id).or_insert(0) += 1;
-	    }
-	}
 
-	counts
-    }
-    
+    // TODO: this might not being used currently
     /// Returns (if exists) the index of a `Task` in `vm_tasks_ready` with specified `task_id`
     /// 
     /// # Arguments

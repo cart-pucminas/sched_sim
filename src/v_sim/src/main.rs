@@ -58,6 +58,7 @@ fn main() {
     let total = args.number_of_tasks();
     let scheduler = args.scheduler();
     let mapper = args.mapper();
+    let cdf_tol = args.tol();
     let seed = args.seed();
    
     let runtime = Builder::new_current_thread()
@@ -76,6 +77,7 @@ fn main() {
 	    &mapper,
 	    Arc::clone(&total_tasks),
 	    total,
+	    cdf_tol,
 	    Arc::clone(&ram)
 	).await.expect("Failed to create VM");	    
 	debug!("Initiating... {:?}", thread::current().id());

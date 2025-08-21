@@ -32,27 +32,29 @@ use tokio::sync::{Mutex};
 pub struct Task
 {
     /// Task unique identifier (private field)
-    pub ts_id		: u8,
+    pub ts_id			: u8,
     /// Task application name (private field)
-    ts_name		: String,
+    ts_name			: String,
     /// Task total workload to be processed (private field)
-    ts_total_workload	: u64,
+    ts_total_workload		: u64,
     /// Task workload left to be processed (private field)
-    ts_left_workload	: u64,
+    ts_left_workload		: u64,
     /// Task current execution time to process (private field)
-    ts_current_exectime : u64,
+    ts_current_exectime		: u64,
     /// Task total memory addresses to be accessed during simulation (private field)
-    ts_mem_addresses	: Vec<Addr>,
+    ts_mem_addresses		: Vec<Addr>,
     /// Task indexer to the last memory address accessed (private field)
-    ts_mem_indexer      : u64,
+    ts_mem_indexer		: u64,
     /// Task cr3 addr.
-    ts_cr3              : u64,
+    ts_cr3			: u64,
 
-    ts_cache_acesses    : HashMap<usize, u64>, // Global hotness
-    ts_recent_acesses   : VecDeque<usize>,    // Last N acesses
+    ts_window_size              : usize,
+    ts_cache_acesses		: HashMap<usize, u64>, // Global hotness
+    ts_recent_acesses		: VecDeque<usize>,     // Last window_size acesses
+    ts_previous_accesses	: VecDeque<usize>,
 
-    ts_last_vcpu_id      : usize,
-    ts_current_vcpu_id   : usize,
+    ts_last_vcpu_id		: usize,
+    ts_current_vcpu_id		: usize,
 
 
     // Times
@@ -99,6 +101,9 @@ impl Task
 	    id,
 	    thread::current().id(),
 	);
+
+	// Ideally window_size must be equal (or less) than VM's quantum
+	let window_size = 300 as usize;
 	Self {
 	    ts_id: id,
 	    ts_name: name.to_string(),
@@ -108,9 +113,11 @@ impl Task
 	    ts_mem_addresses: addresses,
 	    ts_mem_indexer: 0,
 	    ts_cr3: cr3,
-	    
+
+	    ts_window_size: window_size,
 	    ts_cache_acesses: HashMap::new(),
-	    ts_recent_acesses: VecDeque::with_capacity(300),
+	    ts_recent_acesses: VecDeque::with_capacity(window_size),
+	    ts_previous_accesses: VecDeque::with_capacity(window_size * 2),
 	    ts_last_vcpu_id: usize::MAX,
 	    ts_current_vcpu_id: usize::MAX,
 
@@ -254,11 +261,22 @@ impl Task
 	Ok(&mut self.ts_mem_addresses[initial_position..final_position])
     }
 
-    pub fn update_hotness(&mut self, index: usize, n: usize) {
+    pub fn update_hotness(&mut self, index: usize) {
 	*self.ts_cache_acesses.entry(index).or_insert(0) += 1;
 
-	if self.ts_recent_acesses.len() == n {
-	    self.ts_recent_acesses.pop_front();
+	// Store into previous_accesses only when processing iteration is finished
+	// i.e., whenever len == window_size (or vecdeque's capacity)
+
+	// recent_accesses will be, always, in one processing iteration "higher" than previous_accesses
+	// but previous_accesses can hold twice the size of recent_accesses
+	if self.ts_recent_acesses.len() == self.ts_window_size {
+	    let removed_index = self.ts_recent_acesses.pop_front();
+
+	    
+	    self.ts_previous_accesses.push_back(removed_index.expect("Task -> Expected to find atleast one cache index"));
+	    if self.ts_previous_accesses.len() == self.ts_previous_accesses.capacity() {
+		self.ts_previous_accesses.pop_front();
+	    }
 	}
 	self.ts_recent_acesses.push_back(index);
     }
@@ -267,7 +285,6 @@ impl Task
 	&self.ts_cache_acesses
     }
 
-
     pub fn get_hotness_recent(&self) -> HashMap<usize, u64> {
 	let mut counts = HashMap::new();
 
@@ -275,6 +292,16 @@ impl Task
 	    *counts.entry(i).or_insert(0) += 1;
 	}
 
+	counts
+    }
+
+    pub fn get_hotness_previous(&self) -> HashMap<usize, u64> {
+	let mut counts = HashMap::new();
+
+	for &i in &self.ts_previous_accesses {
+	    *counts.entry(i).or_insert(0) += 1;	    
+	}
+	
 	counts
     }
 

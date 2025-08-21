@@ -15,6 +15,7 @@ pub struct Args{
     /// This defines which mapper VM's will be using
     mapper: String,
     ///
+    cdf_tol: f64,
 
     seed: usize,
 }
@@ -29,6 +30,7 @@ impl Args {
     const OPT_NUM_TASKS: &'static str = "--num_tasks";
     const OPT_SCHEDULER: &'static str = "--scheduler";
     const OPT_MAPPER: &'static str = "--mapper";
+    const OPT_CDF_TOL: &'static str = "--tol";
     const OPT_SEED: &'static str = "--seed";
 
     pub fn parse(args: Vec<String>) -> Result<Self> {
@@ -37,6 +39,7 @@ impl Args {
 	let mut num_tasks: usize = 25;
 	let mut scheduler: String = "RoundRobin".to_string();
 	let mut mapper: String = "FIFO".to_string();
+	let mut tol: f64 = 0.6;
 	let mut seed: usize = 1;
 	
 	let mut i: usize = 1;
@@ -66,6 +69,10 @@ impl Args {
 		    i += 1;
 		    mapper = args[i].clone();
 		}
+		Self::OPT_CDF_TOL => {
+		    i += 1;
+		    tol = args[i].parse::<f64>().unwrap();
+		}
 		Self::OPT_SEED => {
 		    i += 1;
 		    seed = args[i].parse::<usize>().unwrap();
@@ -84,6 +91,7 @@ impl Args {
 	    num_vcpus,
 	    scheduler,
 	    mapper,
+	    cdf_tol: tol,
 	    seed,
 	})
     }
@@ -123,5 +131,9 @@ impl Args {
     
     pub fn mapper(&self) -> String {
         self.mapper.clone()
+    }
+
+    pub fn tol(&self) -> f64 {
+	self.cdf_tol
     }
 }

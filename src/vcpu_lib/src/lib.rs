@@ -48,13 +48,15 @@ pub struct VCPU
     /// `vCPU`'s running `Task`
     running_task	: Option<Task>,    
     /// `vCPU`'s L1 Cache
-    pub cache_l1            : Cache,
+    pub cache_l1	: Cache,
     /// `vCPU`'s L2 Cache
-    pub cache_l2            : Arc<Mutex<Cache>>,
+    pub cache_l2	: Arc<Mutex<Cache>>,
     /// `vCPU`'s L3 Cache
-    pub cache_l3            : Arc<Mutex<Cache>>,
-
-    pub mmu             : MMU,
+    pub cache_l3	: Arc<Mutex<Cache>>,
+    /// `vCPU`'s MMU
+    pub mmu		: MMU,
+    /// `vCPU`'s NUMA-group id
+    pub vcpu_group_id   : u8,
 }
 
 //==================================================================================================
@@ -69,6 +71,7 @@ impl VCPU {
 	cache_l2: Arc<Mutex<Cache>>,
 	cache_l3: Arc<Mutex<Cache>>,
 	ram     : Arc<Mutex<RAM>>,
+	group_id: u8
     ) -> Result<Self>
     {
 	debug!(
@@ -87,6 +90,7 @@ impl VCPU {
 	    cache_l2,
 	    cache_l3,
 	    mmu,
+	    vcpu_group_id: group_id
 	})
     }
 
@@ -146,7 +150,7 @@ impl VCPU {
 		sleep(Duration::from_nanos(2_000)).await;
 		let (block_l1, index_l1) = vcpu.cache_l1.cache_lookup(phys_address);
 		if let Some(block) = block_l1 {
-		    task.update_hotness(index_l1.unwrap() as usize, 300);
+		    task.update_hotness(index_l1.unwrap() as usize);
 		    continue;
 		}
 
@@ -157,7 +161,7 @@ impl VCPU {
 		    l2.cache_lookup(phys_address)
 		};
 		if let Some(block) = block_l2 {
-		    task.update_hotness(index_l2.unwrap() as usize, 300);
+		    task.update_hotness(index_l2.unwrap() as usize);
 		    vcpu.cache_l1.cache_update(phys_address, block.clone());
 		    continue
 		}
@@ -173,7 +177,7 @@ impl VCPU {
 			let mut l2 = vcpu.cache_l2.lock().await;
 			l2.cache_update(phys_address, block.clone());
 		    }
-		    task.update_hotness(index_l3.unwrap() as usize, 300);
+		    task.update_hotness(index_l3.unwrap() as usize);
 		    vcpu.cache_l1.cache_update(phys_address, block.clone());
 		    continue
 		}
@@ -194,7 +198,7 @@ impl VCPU {
 		vcpu.cache_l1.cache_update(phys_address, block_ram.clone());
 		{
 		    let index_l1 = vcpu.cache_l1.index_from_address(phys_address);
-		    task.update_hotness(index_l1 as usize, 100);
+		    task.update_hotness(index_l1 as usize);
 		}
 	
 	    }
@@ -228,6 +232,4 @@ impl VCPU {
     pub fn vcpu_id(&self) -> u8 {
 	self.vcpu_id
     }
-    
-
 }

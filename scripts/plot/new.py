@@ -1,271 +1,366 @@
-import re
-import matplotlib.pyplot as plt
-import numpy as np
 import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
-def parse_simulation_file(filepath):
-    algo_regex = re.compile(r'^(round-?\s*robin|jaccard|cdf|balanced|graph)', re.IGNORECASE)
-    header_regex = re.compile(r'^(\d+\.\d+)s,(\d+),(\d+),([\d.]+)')
-    task_regex = re.compile(
-        r'^Task (\d+) - Response time: ([\d.]+)(ms|s), '
-        r'Waiting time: ([\d.]+)s, '
-        r'Execution Time: ([\d.]+)µs'
-    )
-    vcpu_regex = re.compile(
-        r'^vCPU (\d+) - L1: accesses=(\d+), hits=(\d+), misses=(\d+)'
-    )
-    l2_regex = re.compile(
-        r'^L2 \(grupo (\d+)\): accesses=(\d+), hits=(\d+), misses=(\d+)'
-    )
-    l3_regex = re.compile(
-        r'^L3 \(global\): accesses=(\d+), hits=(\d+), misses=(\d+)'
-    )
+# -----------------------------
+# Regex patterns
+# -----------------------------
+header_re = re.compile(r"^---\s+([^-]+(?:-tol[0-9.]+)?)-(\d+)\s+---\s*$")
+l1_re = re.compile(r"^vCPU\s+\d+\s*-\s*L1:\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+l2_re = re.compile(r"^L2\s*\(.*?\):\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+l3_re = re.compile(r"^L3\s*\(.*?\):\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+task_wait_re = re.compile(r"^Task\s+\d+\s+-\s+.*Waiting time:\s*([0-9.eE+-]+)s")
 
-    results = {}
-    current_algo = None
-    current_run = None
+# -----------------------------
+# Strategy sorting
+# -----------------------------
+def strategy_sort_key(name: str):
+    if name == "Balanced":
+        return (0, 0.0)
+    if name == "Jaccard":
+        return (1, 0.0)
+    if name.startswith("CDF-tol"):
+        try:
+            tol = float(name.split("tol", 1)[1])
+        except Exception:
+            tol = 999.0
+        return (2, tol)
+    return (3, 0.0)
 
-    with open(filepath, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+# -----------------------------
+# Parse cache results
+# -----------------------------
+def parse_and_aggregate_cache(filename: str):
+    """
+    Parse results.txt and aggregate raw hits/accesses per execution per strategy.
+    Returns: dict[strategy] -> list of dicts per run with levels L1/L2/L3
+    """
+    runs = defaultdict(list)
+    current_strategy = None
+    run_hits = {"L1": 0, "L2": 0, "L3": 0}
+    run_accesses = {"L1": 0, "L2": 0, "L3": 0}
+    in_block = False
+
+    def flush_block():
+        nonlocal current_strategy, run_hits, run_accesses, in_block
+        if in_block and current_strategy is not None:
+            runs[current_strategy].append({
+                lvl: (run_hits[lvl], run_accesses[lvl])
+                for lvl in ("L1", "L2", "L3")
+            })
+        current_strategy = None
+        run_hits = {"L1": 0, "L2": 0, "L3": 0}
+        run_accesses = {"L1": 0, "L2": 0, "L3": 0}
+        in_block = False
+
+    with open(filename, "r") as f:
+        for raw in f:
+            line = raw.strip()
+            m = header_re.match(line)
+            if m:
+                flush_block()
+                base_name = m.group(1)
+                current_strategy = base_name
+                in_block = True
                 continue
 
-            algo_match = algo_regex.match(line)
-            if algo_match:
-                current_algo = algo_match.group(1).strip().title()
-                results[current_algo] = []
+            if not in_block:
                 continue
 
-            if re.match(r'^\d+\s*-\s*$', line):
-                if current_algo is None:
-                    continue
-                current_run = {
-                    "header": None,
-                    "tasks": [],
-                    "vcpus": [],
-                    "l2": [],
-                    "l3": None
-                }
-                results[current_algo].append(current_run)
-                continue
+            for lvl, regex in zip(("L1","L2","L3"), (l1_re,l2_re,l3_re)):
+                m_lvl = regex.match(line)
+                if m_lvl:
+                    hits = int(m_lvl.group(2))
+                    misses = int(m_lvl.group(3))
+                    acc = hits + misses
+                    run_hits[lvl] += hits
+                    run_accesses[lvl] += acc
+                    break
 
-            header_match = header_regex.match(line)
-            if header_match and current_run:
-                current_run["header"] = {
-                    "total_time_s": float(header_match.group(1)),
-                    "total_contention_ns": int(header_match.group(2)),
-                    "total_sched_time_ns": int(header_match.group(3)),
-                    "ignored_value": float(header_match.group(4))
-                }
-                continue
+    flush_block()
+    return runs
 
-            task_match = task_regex.match(line)
-            if task_match and current_run:
-                task_id = int(task_match.group(1))
-                resp_time = float(task_match.group(2))
-                resp_unit = task_match.group(3)
-                if resp_unit == 'ms':
-                    resp_time /= 1000.
-                waiting_time = float(task_match.group(4))
-                exec_time_us = float(task_match.group(5))
-                current_run["tasks"].append({
-                    "id": task_id,
-                    "response_time_s": resp_time,
-                    "waiting_time_s": waiting_time,
-                    "execution_time_us": exec_time_us
-                })
-                continue
+# --------------------------------
+# Compute mean + std per strategy
+# --------------------------------
 
-            vcpu_match = vcpu_regex.match(line)
-            if vcpu_match and current_run:
-                current_run["vcpus"].append({
-                    "id": int(vcpu_match.group(1)),
-                    "accesses": int(vcpu_match.group(2)),
-                    "hits": int(vcpu_match.group(3)),
-                    "misses": int(vcpu_match.group(4))
-                })
-                continue
+def compute_mean_std(runs):
+    """
+    Compute mean and stddev of hit rates per level per strategy.
+    Sum hits & accesses per run, then mean/std across runs.
+    Returns: dict[strategy] -> dict[level] -> {'mean':..., 'std':...}
+    """
+    summary = {}
+    for strat, run_list in runs.items():
+        summary[strat] = {}
+        for lvl in ("L1","L2","L3"):
+            # Compute hit rates per run
+            hrates = []
+            for run in run_list:
+                hits, accesses = run[lvl]
+                hr = hits / accesses if accesses > 0 else 0.0
+                hrates.append(hr)
+            summary[strat][lvl] = {
+                "mean": np.mean(hrates),
+                "std": np.std(hrates)
+            }
+    return summary
 
-            l2_match = l2_regex.match(line)
-            if l2_match and current_run:
-                current_run["l2"].append({
-                    "group": int(l2_match.group(1)),
-                    "accesses": int(l2_match.group(2)),
-                    "hits": int(l2_match.group(3)),
-                    "misses": int(l2_match.group(4))
-                })
-                continue
+# -----------------------------
+# Normalize to baseline
+# -----------------------------
 
-            l3_match = l3_regex.match(line)
-            if l3_match and current_run:
-                current_run["l3"] = {
-                    "accesses": int(l3_match.group(1)),
-                    "hits": int(l3_match.group(2)),
-                    "misses": int(l3_match.group(3))
-                }
-                continue
+def normalize_to_baseline(summary, baseline_key="Balanced"):
+    base = summary[baseline_key]
+    norm = {}
+    for strat, lvls in summary.items():
+        if strat == baseline_key:
+            continue
+        norm[strat] = {}
+        for lvl in ("L1","L2","L3"):
+            b_mean = base[lvl]["mean"]
+            norm[strat][lvl] = {
+                "mean": (lvls[lvl]["mean"]/b_mean) if b_mean>0 else float("nan"),
+                "std": (lvls[lvl]["std"]/b_mean) if b_mean>0 else float("nan")
+            }
+    return norm
 
-    return results
+# -----------------------------
+# Plotting
+# -----------------------------
 
-def plot_normalized_cache_hit_rates(dados):
-    algos = list(dados.keys())
-
-    def calc_means_stds(algo_runs):
-        l1_vals = []
-        l2_vals = []
-        l3_vals = []
-        for run in algo_runs:
-            l1_hits = sum(vcpu['hits'] for vcpu in run['vcpus'])
-            l1_access = sum(vcpu['accesses'] for vcpu in run['vcpus'])
-            l2_hits = sum(l2['hits'] for l2 in run['l2'])
-            l2_access = sum(l2['accesses'] for l2 in run['l2'])
-            l3_hits = run['l3']['hits']
-            l3_access = run['l3']['accesses']
-
-            l1_vals.append(l1_hits / l1_access if l1_access > 0 else 0)
-            l2_vals.append(l2_hits / l2_access if l2_access > 0 else 0)
-            l3_vals.append(l3_hits / l3_access if l3_access > 0 else 0)
-        return (
-            np.mean(l1_vals), np.std(l1_vals),
-            np.mean(l2_vals), np.std(l2_vals),
-            np.mean(l3_vals), np.std(l3_vals)
-        )
-
-    stats = {}
-    for algo in algos:
-        stats[algo] = calc_means_stds(dados[algo])
-
-    l1_base, _, l2_base, _, l3_base, _ = stats["Balanced"]
-    algos_no_balanced = [a for a in algos if a != "Balanced"]
-
-    l1_means_norm = []
-    l1_stds_norm = []
-    l2_means_norm = []
-    l2_stds_norm = []
-    l3_means_norm = []
-    l3_stds_norm = []
-
-    for algo in algos_no_balanced:
-        l1_mean, l1_std, l2_mean, l2_std, l3_mean, l3_std = stats[algo]
-        l1_means_norm.append(l1_mean / l1_base if l1_base != 0 else 0)
-        l1_stds_norm.append(l1_std / l1_base if l1_base != 0 else 0)
-        l2_means_norm.append(l2_mean / l2_base if l2_base != 0 else 0)
-        l2_stds_norm.append(l2_std / l2_base if l2_base != 0 else 0)
-        l3_means_norm.append(l3_mean / l3_base if l3_base != 0 else 0)
-        l3_stds_norm.append(l3_std / l3_base if l3_base != 0 else 0)
-
-    x = np.arange(len(algos_no_balanced))
+def plot_normalized_cache(norm_rates, baseline_key="Balanced"):
+    strategies = sorted(norm_rates.keys(), key=strategy_sort_key)
+    levels = ["L1","L2","L3"]
+    x = np.arange(len(strategies))
     width = 0.25
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    rects1 = ax.bar(x - width, l1_means_norm, width, yerr=l1_stds_norm, capsize=5, label='L1 Cache Hit Rate')
-    rects2 = ax.bar(x, l2_means_norm, width, yerr=l2_stds_norm, capsize=5, label='L2 Cache Hit Rate')
-    rects3 = ax.bar(x + width, l3_means_norm, width, yerr=l3_stds_norm, capsize=5, label='L3 Cache Hit Rate')
+    plt.figure(figsize=(12, 6))
+    for j, lvl in enumerate(levels):
+        vals = [norm_rates[s][lvl]["mean"] for s in strategies]
+        errs = [norm_rates[s][lvl]["std"] for s in strategies]
+        plt.bar(x + (j-1)*width, vals, width, yerr=errs, capsize=5, label=lvl, zorder=2)
 
-    ax.axhline(1, color='black', linestyle='--', linewidth=1, label='Balanced baseline (1.0)')
-
-    ax.set_ylabel('Normalized Cache Hit Rate (relative to Balanced)')
-    ax.set_title('Normalized Cache Hit Rates by Algorithm (with Std Dev)')
-    ax.set_xticks(x)
-    ax.set_xticklabels(algos_no_balanced)
-    ax.legend(loc="lower right")
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.xticks(x, strategies, rotation=45, ha="right")
+    plt.ylabel(f"Normalized Hit Rate (relative to {baseline_key})")
+    plt.title("Normalized Hit Rates per Strategy by Cache Level\n(with stddev error bars)")
+    plt.axhline(1.0, linestyle="--", color="red", label=f"Baseline = {baseline_key}")
+    plt.legend(loc="lower right")
+    plt.grid(linestyle="--",alpha=0.5,zorder=1)
     plt.tight_layout()
-
-    filename = "normalized_cache_hit_rates_with_std.png"
-    filepath = os.path.join(os.getcwd(), filename)
-    plt.savefig(filepath)
-    plt.close()
-    print(f"Saved: {filepath}")
+    plt.savefig("hit_rate.png")
+    # plt.show()
 
 
-def plot_random_waiting_times_cdf(dados):
-    random_run = 1
+# -----------------------------
+# Parse task waiting times
+# -----------------------------
+def parse_task_waiting_times(filename: str):
+    runs = defaultdict(list)
+    current_strategy = None
+    current_waits = []
+    in_block = False
 
-    plt.figure(figsize=(10, 6))
+    def flush_block():
+        nonlocal current_strategy, current_waits, in_block
+        if in_block and current_strategy:
+            runs[current_strategy].append(current_waits)
+        current_strategy = None
+        current_waits = []
+        in_block = False
 
-    balanced_99_time = None
-        
-    for algo, runs in dados.items():
-        run_data = runs[random_run]
-        waiting_times = sorted(task["waiting_time_s"] for task in run_data["tasks"])
-        percentiles = [(i + 1) / len(waiting_times) * 100 for i in range(len(waiting_times))]
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            m = header_re.match(line)
+            if m:
+                flush_block()
+                current_strategy = m.group(1)
+                in_block = True
+                continue
+            if not in_block:
+                continue
+            m_task = task_wait_re.match(line)
+            if m_task:
+                current_waits.append(float(m_task.group(1)))
+    flush_block()
+    return runs
 
-        plt.plot(waiting_times, percentiles, linestyle="--", label=algo)
+# -----------------------------
+# Compute percentiles
+# -----------------------------
+def compute_percentile_summary(runs, percentile=99, baseline=None, normalize=False, cdf_only=False):
+    summary = {}
+    raw_means = {}
+    raw_stds = {}
+    for strat, run_list in runs.items():
+        if cdf_only and not strat.startswith("CDF"):
+            continue
+        pct_values = []
+        for run_waits in run_list:
+            if run_waits:
+                sorted_times = np.sort(run_waits)
+                pct = np.percentile(sorted_times, percentile)
+                pct_values.append(pct)
+        if pct_values:
+            raw_means[strat] = np.mean(pct_values)
+            raw_stds[strat] = np.std(pct_values)
 
+    if normalize:
+        if baseline not in raw_means:
+            raise ValueError(f"Baseline '{baseline}' not found.")
+        base_mean = raw_means[baseline]
+        for strat in raw_means:
+            summary[strat] = {"mean": raw_means[strat]/base_mean, "std": raw_stds[strat]/base_mean}
+    else:
+        for strat in raw_means:
+            summary[strat] = {"mean": raw_means[strat], "std": raw_stds[strat]}
+    return summary
 
-        if algo.lower() == "balanced":
-            idx_99 = int(len(waiting_times) * 0.99) - 1
-            idx_99 = max(0, min(idx_99, len(waiting_times) - 1))
-            balanced_99_time = waiting_times[idx_99]
+def plot_percentile(summary, percentile=99, title="", filename="percentile.png", excluded_baseline=None):
+    strategies = sorted(summary.keys(), key=strategy_sort_key)
 
-    if balanced_99_time is not None:
-        plt.axvline(x=balanced_99_time, color='red', linestyle=':', linewidth=2,
-                    label='Balanced 99th percentile')
-        
-    plt.xlabel("Waiting time (s)")
-    plt.ylabel("Task (%)")
-    plt.title(f"Cumulative Distribution Function of Tasks' Waiting Times by Strategy")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    filename = f"waiting_times_cdf_run_{random_run}.png"
-    filepath = os.path.join(os.getcwd(), filename)
-
-    plt.savefig(filepath)
-    plt.close()
-    print(f"Saved: {filepath}")
-
-def plot_stacked_contention_sched_times(dados):
-    algos = list(dados.keys())
-
-
-    sched_means = []
-    contention_means = []
-
-    for algo in algos:
-        sched_times = []
-        contention_times = []
-        for run in dados[algo]:
-            if run["header"] is not None:
-                sched_times.append(run["header"]["total_sched_time_ns"])
-                contention_times.append(run["header"]["total_contention_ns"])
-
-        avg_sched = np.mean(sched_times) if sched_times else 0
-        avg_contention = np.mean(contention_times) if contention_times else 0
-        sched_means.append(avg_sched / 1_000_000)
-        contention_means.append(avg_contention / 1_000_000)
-
-    diff_means = [max(c - s, 0) for c, s in zip(contention_means, sched_means)]
-
-    y_pos = np.arange(len(algos))
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-
-    ax.barh(y_pos, sched_means, color='tab:blue', label='Avg Total Sched Time (ns)')
-    ax.barh(y_pos, diff_means, left=sched_means, color='tab:orange', label='Avg Contention Time (ns) excluding Sched')
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(algos)
-    ax.set_xlabel('Time (miliseconds)')
-    ax.set_title('Average Total Contention and Scheduling Times by Algorithm')
-    ax.legend()
-    ax.grid(axis='x', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-
-    filename = "stacked_contention_sched_times.png"
-    filepath = os.path.join(os.getcwd(), filename)
-    plt.savefig(filepath)
-    plt.close()
-    print(f"Saved: {filepath}")
-
+    if excluded_baseline:
+        strategies = [s for s in strategies if s != excluded_baseline]
     
+    means = [summary[s]["mean"] for s in strategies]
+    stds = [summary[s]["std"] for s in strategies]
+    x = np.arange(len(strategies))
+    plt.figure(figsize=(12,6))
+    plt.bar(x, means, yerr=stds, capsize=5, color="skyblue", zorder=2)
+    plt.xticks(x, strategies, rotation=45, ha="right")
+    ylabel = f"Task Waiting Time p{percentile}"
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.axhline(1.0 if "Normalized" in title else 0, linestyle="--", color="red", label="Baseline" if "Normalized" in title else "")
+    plt.grid(linestyle="--",alpha=0.5,zorder=1)
+    plt.tight_layout()
+    plt.savefig(filename)
 
+# -----------------------------
+# Parse execution's time line
+# -----------------------------
+
+def parse_time_line(line):
+    """Parse the first line: total_time_s, contention_ns, scheduling_ns, ..."""
+    parts = line.strip().split(",")
+    total_s = float(parts[0].replace("s", ""))
+    contention_ns = int(parts[1])
+    scheduling_ns = int(parts[2])
+    
+    # Convert ns to seconds
+    contention_s = contention_ns / 1e9
+    scheduling_s = scheduling_ns / 1e9
+    remaining_s = total_s - contention_s - scheduling_s
+    return total_s, contention_s, scheduling_s, remaining_s
+
+def aggregate_time_data(filename):
+    """
+    Aggregate time data per strategy (mean over multiple runs).
+    Returns: dict[strategy] -> dict with mean times (scheduling, contention, remaining)
+    """
+    from collections import defaultdict
+    import re
+
+    header_re = re.compile(r"^---\s+([^-]+(?:-tol[0-9.]+)?)-\d+\s+---")
+    times = defaultdict(list)
+    current_strategy = None
+    parsed_first_line = False  # track if we parsed the first line after header
+
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            m = header_re.match(line)
+            if m:
+                current_strategy = m.group(1)
+                parsed_first_line = False  # reset for new block
+                continue
+
+            if current_strategy and not parsed_first_line:
+                # This is the first line after the header
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    total_s = float(parts[0].replace("s", ""))
+                    contention_s = int(parts[1]) / 1e9
+                    scheduling_s = int(parts[2]) / 1e9
+                    remaining_s = total_s - contention_s - scheduling_s
+                    times[current_strategy].append((scheduling_s, contention_s, remaining_s))
+                    parsed_first_line = True  # only parse once per block
+
+    # Compute mean for each strategy
+    means = {}
+    for strat, runs in times.items():
+        runs_arr = np.array(runs)
+        mean_vals = np.mean(runs_arr, axis=0)
+        means[strat] = {"scheduling": mean_vals[0],
+                        "contention": mean_vals[1],
+                        "remaining": mean_vals[2]}
+    return means
+
+
+def plot_stacked_times(time_means):
+    strategies = sorted(time_means.keys(), key=strategy_sort_key)
+    sched = [time_means[s]["scheduling"] for s in strategies]
+    cont  = [time_means[s]["contention"] for s in strategies]
+    rest  = [time_means[s]["remaining"] for s in strategies]
+
+    y = np.arange(len(strategies))
+
+    plt.figure(figsize=(12, 6))
+    plt.barh(y, sched, color="orange", label="Scheduling time", zorder=2)
+    plt.barh(y, cont, left=sched, color="red", label="Contention time", zorder=2)
+    plt.barh(y, rest, left=np.array(sched)+np.array(cont), color="skyblue", label="Remaining time", zorder=2)
+
+    plt.yticks(y, strategies)
+    plt.xlabel("Time (seconds)")
+    plt.title("Execution Time Breakdown per Strategy (mean of runs)")
+    plt.grid(linestyle="--",alpha=0.5,zorder=1)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("stacked_time.png")
+    # plt.show()
+
+
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    arquivo = "partial_results.txt"
-    dados = parse_simulation_file(arquivo)
-    plot_random_waiting_times_cdf(dados)
-    plot_normalized_cache_hit_rates(dados)
-    plot_stacked_contention_sched_times(dados)
+    filename = "results.txt"
+
+    # ---- Cache hit rates ----
+    totals = parse_and_aggregate_cache(filename)
+    summary = compute_mean_std(totals)
+    norm_rates = normalize_to_baseline(summary, baseline_key="Balanced")
+    plot_normalized_cache(norm_rates, baseline_key="Balanced")
+
+    # ---- Task waiting times ----
+    runs = parse_task_waiting_times(filename)
+
+    # CDF-only p99
+    summary_cdf = compute_percentile_summary(runs, percentile=99, normalize=False, cdf_only=True)
+    plot_percentile(summary_cdf, percentile=99, title="Task Waiting Time p99 (CDF strategies only)", filename="p99_cdf_only.png")
+
+    # All strategies normalized to Balanced
+    summary_all_norm = compute_percentile_summary(runs, percentile=99, baseline="Balanced", normalize=True, cdf_only=False)
+    plot_percentile(summary_all_norm, percentile=99, title="Normalized Task Waiting Time p99 (All strategies)", filename="p99_all_norm.png", excluded_baseline="Balanced")
+
+    # Execution's stacked times
+    time_means = aggregate_time_data("results.txt")
+    plot_stacked_times(time_means)
+    
+    # Optional: print summary
+    print("---- Cache hit rates (absolute) ----")
+    for strat in sorted(summary.keys(), key=strategy_sort_key):
+        l1,l2,l3 = summary[strat]["L1"]["mean"], summary[strat]["L2"]["mean"], summary[strat]["L3"]["mean"]
+        print(f"{strat:>12} | L1={l1:.4f}  L2={l2:.4f}  L3={l3:.4f}")
+        
+    print("---- Task waiting time percentiles (CDF only) ----")
+    for s in sorted(summary_cdf.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | mean p99={summary_cdf[s]['mean']:.4f} ± {summary_cdf[s]['std']:.4f}")
+
+    print("---- Task waiting time percentiles normalized to Balanced ----")
+    for s in sorted(summary_all_norm.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | mean p99 normalized={summary_all_norm[s]['mean']:.4f} ± {summary_all_norm[s]['std']:.4f}")
+

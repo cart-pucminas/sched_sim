@@ -1,268 +1,465 @@
-import subprocess
 import os
-import matplotlib.pyplot as plt
+import re
 import numpy as np
-from os.path import dirname, join, realpath
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
-PROJ_ROOT = join(dirname(dirname(dirname(realpath(__file__)))))
-CODE_DIR = join(PROJ_ROOT, "bin", "v_sim")
-PLOTS_DIR = join(PROJ_ROOT, "src", "v_sim", "plot")
-BINARY_PATH = join("bin", "v_sim")  
-FIGSIZE = (8, 4)
-COLORS = {
-    "DARK_RED"  : "#8B0000",
-    "DARK_GREEN": "#006400",
-    "DARK_BLUE": "#00008B",
-}
+# -----------------------------
+# Regex patterns
+# -----------------------------
+header_re = re.compile(r"^---\s+([^-]+(?:-tol[0-9.]+)?)-(\d+)\s+---\s*$")
+l1_re = re.compile(r"^vCPU\s+\d+\s*-\s*L1:\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+l2_re = re.compile(r"^L2\s*\(.*?\):\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+l2_group_re = re.compile(r"^L2\s*\(grupo (\d+)\):\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+l3_re = re.compile(r"^L3\s*\(.*?\):\s*accesses=(\d+),\s*hits=(\d+),\s*misses=(\d+)\s*$")
+task_wait_re = re.compile(r"^Task\s+\d+\s+-\s+.*Waiting time:\s*([0-9.eE+-]+)s")
 
-NUM_ITERATIONS = 10
-base_tasks = 25
-num_threads1 = [1, 2, 4, 8, 12]
-num_threads = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-num_cpus = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+# -----------------------------
+# Strategy sorting
+# -----------------------------
+def strategy_sort_key(name: str):
+    if name == "RoundRobin":
+        return (0, 0.0)
+    if name == "DIO":
+        return (1, 0.0)
+    if name.startswith("CDF-tol"):
+        try:
+            tol = float(name.split("tol", 1)[1])
+        except Exception:
+            tol = 999.0
+        return (2, tol)
+    return (3, 0.0)
 
-def run_iteration(args):
-    try:
-        result = subprocess.run(
-            [BINARY_PATH] + args,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        line = result.stdout.strip()
-        parts = line.split(",")
+# -----------------------------
+# Parse cache results
+# -----------------------------
+def parse_and_aggregate_cache(filename: str):
+    """
+    Parse results.txt and aggregate raw hits/accesses per execution per strategy.
+    Returns: dict[strategy] -> list of dicts per run with levels L1/L2/L3
+    """
+    runs = defaultdict(list)
+    current_strategy = None
+    run_hits = {"L1": 0, "L2": 0, "L3": 0}
+    run_accesses = {"L1": 0, "L2": 0, "L3": 0}
+    in_block = False
 
-        exec_time_s = float(parts[0].strip().replace("s", ""))
-        contention_ns = int(parts[1].strip())
-        contention_ratio = float(parts[2].strip())
-        return exec_time_s, contention_ns, contention_ratio
+    def flush_block():
+        nonlocal current_strategy, run_hits, run_accesses, in_block
+        if in_block and current_strategy is not None:
+            runs[current_strategy].append({
+                lvl: (run_hits[lvl], run_accesses[lvl])
+                for lvl in ("L1", "L2", "L3")
+            })
+        current_strategy = None
+        run_hits = {"L1": 0, "L2": 0, "L3": 0}
+        run_accesses = {"L1": 0, "L2": 0, "L3": 0}
+        in_block = False
 
-    except Exception as e:
-        print(f"Erro na execução: {e}")
-        return None
-    
-def results_threads_strong():
-    times_per_thread = {}
+    with open(filename, "r") as f:
+        for raw in f:
+            line = raw.strip()
+            m = header_re.match(line)
+            if m:
+                flush_block()
+                base_name = m.group(1)
+                current_strategy = base_name
+                in_block = True
+                continue
 
-    for threads in num_threads:
-        print(f"\n>> Testando: -num_vcpus {threads}")
-        times = []
-        for i in range(NUM_ITERATIONS):
-            print(f"  Iteração {i+1}/{NUM_ITERATIONS}...", end="\r")
-            args = ["--num_vcpus", str(threads), "--seed", str(i)]
-            result = run_iteration(args)
-            if result:
-                times.append(result[0])  # apenas tempo de execução
+            if not in_block:
+                continue
 
-        if not times:
-            print(f"[ERRO] Nenhum resultado válido para {threads} threads.")
+            for lvl, regex in zip(("L1","L2","L3"), (l1_re,l2_re,l3_re)):
+                m_lvl = regex.match(line)
+                if m_lvl:
+                    hits = int(m_lvl.group(2))
+                    misses = int(m_lvl.group(3))
+                    acc = hits + misses
+                    run_hits[lvl] += hits
+                    run_accesses[lvl] += acc
+                    break
+
+    flush_block()
+    return runs
+
+# --------------------------------
+# Compute mean + std per strategy
+# --------------------------------
+
+def compute_mean_std(runs):
+    """
+    Compute mean and stddev of hit rates per level per strategy.
+    Sum hits & accesses per run, then mean/std across runs.
+    Returns: dict[strategy] -> dict[level] -> {'mean':..., 'std':...}
+    """
+    summary = {}
+    for strat, run_list in runs.items():
+        summary[strat] = {}
+        for lvl in ("L1","L2","L3"):
+            # Compute hit rates per run
+            hrates = []
+            for run in run_list:
+                hits, accesses = run[lvl]
+                hr = hits / accesses if accesses > 0 else 0.0
+                hrates.append(hr)
+            summary[strat][lvl] = {
+                "mean": np.mean(hrates),
+                "std": np.std(hrates)
+            }
+    return summary
+
+# -----------------------------
+# Normalize to baseline
+# -----------------------------
+
+def normalize_to_baseline(summary, baseline_key="Balanced"):
+    base = summary[baseline_key]
+    norm = {}
+    for strat, lvls in summary.items():
+        if strat == baseline_key:
             continue
+        norm[strat] = {}
+        for lvl in ("L1","L2","L3"):
+            b_mean = base[lvl]["mean"]
+            norm[strat][lvl] = {
+                "mean": (lvls[lvl]["mean"]/b_mean) if b_mean>0 else float("nan"),
+                "std": (lvls[lvl]["std"]/b_mean) if b_mean>0 else float("nan")
+            }
+    return norm
 
-        times_per_thread[threads] = times
-        print(f"\n   >> Média de tempo {np.mean(times)}")
+# -----------------------------
+# Plotting
+# -----------------------------
 
-    return times_per_thread
+def plot_normalized_cache(norm_rates, baseline_key="Balanced"):
+    strategies = sorted(norm_rates.keys(), key=strategy_sort_key)
+    levels = ["L1","L2","L3"]
+    x = np.arange(len(strategies))
+    width = 0.25
+
+    plt.figure(figsize=(12, 6))
+    for j, lvl in enumerate(levels):
+        vals = [norm_rates[s][lvl]["mean"] for s in strategies]
+        errs = [norm_rates[s][lvl]["std"] for s in strategies]
+        plt.bar(x + (j-1)*width, vals, width, yerr=errs, capsize=5, label=lvl, zorder=2)
+
+    plt.xticks(x, strategies, rotation=45, ha="right")
+    plt.ylabel(f"Normalized Hit Rate (relative to {baseline_key})")
+    # plt.title("Normalized Hit Rates per Strategy by Cache Level\n(with stddev error bars)")
+    plt.axhline(1.0, linestyle="--", color="red", label=f"Baseline = {baseline_key}")
+    plt.legend(loc="lower right")
+    plt.grid(linestyle="--",alpha=0.5,zorder=1)
+    plt.tight_layout()
+    plt.savefig("hit_rate.png")
+    # plt.show()
+
+
+# -----------------------------
+# Parse task waiting times
+# -----------------------------
+def parse_task_waiting_times(filename: str):
+    runs = defaultdict(list)
+    current_strategy = None
+    current_waits = []
+    in_block = False
+
+    def flush_block():
+        nonlocal current_strategy, current_waits, in_block
+        if in_block and current_strategy:
+            runs[current_strategy].append(current_waits)
+        current_strategy = None
+        current_waits = []
+        in_block = False
+
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            m = header_re.match(line)
+            if m:
+                flush_block()
+                current_strategy = m.group(1)
+                in_block = True
+                continue
+            if not in_block:
+                continue
+            m_task = task_wait_re.match(line)
+            if m_task:
+                current_waits.append(float(m_task.group(1)))
+    flush_block()
+    return runs
+
+# -----------------------------
+# Compute percentiles
+# -----------------------------
+def compute_percentile_summary(runs, percentile=99, baseline=None, normalize=False, cdf_only=False):
+    summary = {}
+    raw_means = {}
+    raw_stds = {}
+    for strat, run_list in runs.items():
+        if cdf_only and not strat.startswith("CDF"):
+            continue
+        pct_values = []
+        for run_waits in run_list:
+            if run_waits:
+                sorted_times = np.sort(run_waits)
+                pct = np.percentile(sorted_times, percentile)
+                pct_values.append(pct)
+        if pct_values:
+            raw_means[strat] = np.mean(pct_values)
+            raw_stds[strat] = np.std(pct_values)
+
+    if normalize:
+        if baseline not in raw_means:
+            raise ValueError(f"Baseline '{baseline}' not found.")
+        base_mean = raw_means[baseline]
+        for strat in raw_means:
+            summary[strat] = {"mean": raw_means[strat]/base_mean, "std": raw_stds[strat]/base_mean}
+    else:
+        for strat in raw_means:
+            summary[strat] = {"mean": raw_means[strat], "std": raw_stds[strat]}
+    return summary
+
+def plot_percentile(summary, percentile=99, title="", filename="percentile.png", excluded_baseline=None):
+    strategies = sorted(summary.keys(), key=strategy_sort_key)
+
+    if excluded_baseline:
+        strategies = [s for s in strategies if s != excluded_baseline]
     
-def plot_normalized_speedup(times_per_thread):
-    if 1 not in times_per_thread:
-        print("Erro: tempo com 1 thread (sequencial) necessário para normalização.")
-        return
+    means = [summary[s]["mean"] for s in strategies]
+    stds = [summary[s]["std"] for s in strategies]
+    x = np.arange(len(strategies))
+    plt.figure(figsize=(12,6))
+    plt.bar(x, means, yerr=stds, capsize=5, color="skyblue", zorder=2)
+    plt.xticks(x, strategies, rotation=45, ha="right")
+    ylabel = f"Task Waiting Time p{percentile}"
+    plt.ylabel(ylabel)
+    # plt.title(title)
+    if "Normalized" in title:
+        plt.axhline(1.0, linestyle="--", color="red", label="Baseline" if "Normalized" in title else "")
+    plt.grid(linestyle="--",alpha=0.5,zorder=1)
+    plt.tight_layout()
+    plt.savefig(filename)
 
-    t_seq = np.mean(times_per_thread[1])
-    # threads = sorted([t for t in times_per_thread.keys() if t != 1])
-    threads = sorted([t for t in times_per_thread.keys() if t in num_threads1 and t != 1])
+# -----------------------------
+# Parse execution's time line
+# -----------------------------
 
-    speedups = []
-    std_errors = []
+def parse_time_line(line):
+    """Parse the first line: total_time_s, contention_ns, scheduling_ns, ..."""
+    parts = line.strip().split(",")
+    total_s = float(parts[0].replace("s", ""))
+    contention_ns = int(parts[1])
+    scheduling_ns = int(parts[2])
+    
+    # Convert ns to seconds
+    contention_s = contention_ns / 1e9
+    scheduling_s = scheduling_ns / 1e9
+    remaining_s = total_s - contention_s - scheduling_s
+    return total_s, contention_s, scheduling_s, remaining_s
 
-    for t in threads:
-        avg = np.mean(times_per_thread[t])
-        speedup = t_seq / avg
-        sem = np.std(times_per_thread[t]) / np.sqrt(NUM_ITERATIONS)
+def aggregate_time_data(filename):
+    """
+    Aggregate time data per strategy (mean over multiple runs).
+    Returns: dict[strategy] -> dict with mean times (scheduling, contention, remaining)
+    """
+    from collections import defaultdict
+    import re
 
-        speedups.append(speedup)
-        std_errors.append(sem)
+    header_re = re.compile(r"^---\s+([^-]+(?:-tol[0-9.]+)?)-\d+\s+---")
+    times = defaultdict(list)
+    current_strategy = None
+    parsed_first_line = False
 
-    color_palette = plt.get_cmap('tab10')
-    bar_colors = [color_palette(i) for i in range(len(threads))]
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            m = header_re.match(line)
+            if m:
+                current_strategy = m.group(1)
+                parsed_first_line = False
+                continue
 
-    plt.figure(figsize=FIGSIZE)
-    x_labels = [str(t) for t in threads]
-    x_pos = np.arange(len(threads))
+            if current_strategy and not parsed_first_line:
 
-    bars = plt.bar(
-        x_pos,
-        speedups,
-        yerr=std_errors,
-        align="center",
-        alpha=0.9,
-        capsize=6,
-        color=bar_colors,
-        edgecolor="black",
-        label="Speedup"
-    )
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    total_s = float(parts[0].replace("s", ""))
+                    contention_s = int(parts[1]) / 1e9
+                    scheduling_s = int(parts[2]) / 1e9
+                    remaining_s = total_s - contention_s - scheduling_s
+                    times[current_strategy].append((scheduling_s, contention_s, remaining_s))
+                    parsed_first_line = True
 
-    plt.axhline(y=1.0, color='blue', linestyle='--', label="Sequential Execution")
-    plt.xticks(x_pos, x_labels)
-    plt.ylabel("Speedup")
-    plt.xlabel("Number of vCPUs")
-    plt.title("Speedup (Comp. to sequential execution)")
-    plt.grid(True, axis="y", linestyle="--", alpha=0.6)
+    means = {}
+    for strat, runs in times.items():
+        runs_arr = np.array(runs)
+        mean_vals = np.mean(runs_arr, axis=0)
+        means[strat] = {"scheduling": mean_vals[0],
+                        "contention": mean_vals[1],
+                        "remaining": mean_vals[2]}
+    return means
+
+def plot_stacked_times(time_means):
+    strategies = list(time_means.keys())
+    cont  = np.array([time_means[s]["contention"] for s in strategies])
+    rest  = np.array([time_means[s]["remaining"] for s in strategies])
+
+    sort_idx = np.argsort(cont)
+    strategies_sorted = [strategies[i] for i in sort_idx]
+    cont_sorted = cont[sort_idx]
+    rest_sorted = rest[sort_idx]
+
+    y = np.arange(len(strategies_sorted))
+
+    plt.figure(figsize=(12, 6))
+    plt.barh(y, cont_sorted, color="skyblue", label="Contention time", zorder=2)
+    plt.barh(y, rest_sorted, left=cont_sorted, color="#ACACAC", label="Remaining time", zorder=2)
+
+    plt.yticks(y, strategies_sorted)
+    plt.xlabel("Time (seconds)")
+    plt.grid(linestyle="--", alpha=0.5, zorder=1)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("stacked_time.png")
+    # plt.show()
+    
+def parse_and_aggregate_cache_per_group(filename: str):
+    """
+    Parse results.txt and aggregate raw hits/accesses per execution per strategy.
+    Returns: dict[strategy] -> list of dicts per run with L2 accesses per group.
+    """
+    runs = defaultdict(list)
+    current_strategy = None
+    run_accesses = {}  # dict[group] -> accesses
+    in_block = False
+
+    def flush_block():
+        nonlocal current_strategy, run_accesses, in_block
+        if in_block and current_strategy is not None:
+            runs[current_strategy].append({"L2_groups": [run_accesses.get(i, 0) for i in range(3)]})
+        current_strategy = None
+        run_accesses = {}
+        in_block = False
+
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            m = header_re.match(line)
+            if m:
+                flush_block()
+                current_strategy = m.group(1)
+                in_block = True
+                continue
+
+            if not in_block:
+                continue
+
+            m_group = l2_group_re.match(line)
+            if m_group:
+                group = int(m_group.group(1))
+                accesses = int(m_group.group(2))
+                run_accesses[group] = accesses
+
+    flush_block()
+    return runs
+
+# -----------------------------
+# Compute CV per strategy
+# -----------------------------
+def compute_cv_per_strategy_group(runs):
+    """
+    Compute CV per strategy for L2 accesses across groups.
+    - For each group, compute mean accesses across all executions
+    - Then compute CV across the groups
+    Returns: dict[strategy] -> CV
+    """
+    cv_dict = {}
+    for strat, run_list in runs.items():
+        n_runs = len(run_list)
+        n_groups = 3
+        group_sums = np.zeros(n_groups)
+        for run in run_list:
+            accesses_per_group = run["L2_groups"]
+            group_sums += np.array(accesses_per_group)
+        group_means = group_sums / n_runs
+        mean_of_means = np.mean(group_means)
+        std_of_means = np.std(group_means)
+        cv_dict[strat] = std_of_means / mean_of_means if mean_of_means > 0 else 0.0
+    return cv_dict
+
+def normalize_cv(cv_dict, baseline="RoundRobin"):
+    base_cv = cv_dict.get(baseline, 1.0)
+    norm_cv = {s: cv_dict[s]/base_cv for s in cv_dict if s != baseline}
+    return norm_cv
+
+def plot_normalized_cv(norm_cv, baseline="RoundRobin"):
+    strategies = sorted(norm_cv.keys(), key=strategy_sort_key)
+    x = np.arange(len(strategies))
+    vals = [norm_cv[s] for s in strategies]
+
+    plt.figure(figsize=(10,5))
+    # plt.bar(x, vals, color="skyblue", zorder=2)
+    plt.bar(x, vals, color="skyblue", zorder=2)
+    plt.xticks(x, strategies, rotation=45, ha="right")
+    plt.ylabel(f"Normalized CV of L2 accesses (relative to {baseline})")
+    plt.axhline(1.0, linestyle="--", color="red", label=f"Baseline = {baseline}")
+    plt.grid(linestyle="--", alpha=0.5, zorder=1)
     plt.tight_layout()
     plt.legend()
-
-    plt.savefig(f"{PLOTS_DIR}_speedup_forte.png")
-    print(f"Gráfico salvo em: {PLOTS_DIR}")
-
-def plot_efficiency_vs_speedup(times_per_thread):
-    if 1 not in times_per_thread:
-        print("Erro: tempo com 1 thread (sequencial) necessário para normalização.")
-        return
-
-    t_seq = np.mean(times_per_thread[1])
-    threads = sorted([t for t in times_per_thread.keys() if t != 1])
-
-    speedups = []
-    efficiencies = []
-    labels = []
-
-    for (i, t) in enumerate(threads):
-        times = times_per_thread[t]
-        avg = np.mean(times)
-        speedup = t_seq / avg
-        efficiency = speedup / num_cpus[i]
-
-        speedups.append(speedup)
-        efficiencies.append(efficiency)
-        labels.append(str(t))
-
-    speedups_np = np.array(speedups)
-    efficiencies_np = np.array(efficiencies)
-        
-    poly3 = np.poly1d(np.polyfit(speedups_np, efficiencies_np, deg=3))
-    y_poly3 = poly3(speedups_np)
-
-    poly1 = np.poly1d(np.polyfit(speedups_np, efficiencies_np, deg=1))
-    y_poly1 = poly1(speedups_np)
-
-
-    plt.figure(figsize=FIGSIZE)
-    scatter = plt.scatter(speedups_np, efficiencies_np, c=range(len(threads)), cmap='viridis', s=80, edgecolors='black')
-
-    for i, label in enumerate(labels):
-        plt.annotate(f"{label} vCPU", (speedups_np[i] + 0.15, efficiencies_np[i]), fontsize=9)
-
-    x_fit = np.linspace(min(speedups), max(speedups), 200)
-    plt.plot(x_fit, poly3(x_fit), color=COLORS["DARK_RED"], linestyle='--', linewidth=2, label=f'Sim. Behaviour')
-    # plt.plot(x_fit, poly1(x_fit), color=COLORS["DARK_GREEN"], linestyle='--', linewidth=2, label=f'Linear ')
-    plt.axhline(y=1.0, color='blue', linestyle='--', label="Sequential Execution")
-    plt.axvline(x=1.0, color='blue', linestyle='--')
-
-    plt.xlabel("Speedup")
-    plt.ylabel("Efficiency")
-    plt.title("Efficiency vs Speedup")
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{PLOTS_DIR}_efficiency_speedup_forte.png")
-    print(f"Gráfico salvo em: {PLOTS_DIR}")
-
-
-
-
-
-
-
-
-    
-#################################
-## WEAK
-################################
-
-
-
-
-
-def results_threads_weak():
-    times_per_thread = {}
-
-    num_tasks_list = [base_tasks * t for t in num_threads]
-
-    for threads, tasks in zip(num_threads, num_tasks_list):
-        print(f"\n>> Testando: -num_vcpus {threads} -num_tasks {tasks}")
-        times = []
-        for i in range(NUM_ITERATIONS):
-            print(f"  Iteração {i+1}/{NUM_ITERATIONS}...", end="\r")
-            args = ["--num_vcpus", str(threads), "--num_tasks", str(tasks), "--seed", str(i)]
-            result = run_iteration(args)
-            if result:
-                times.append(result[0])  # apenas tempo de execução
-
-        if not times:
-            print(f"[ERRO] Nenhum resultado válido para {threads} threads.")
-            continue
-
-        times_per_thread[threads] = times
-        print(f"\n   >> Média de tempo {np.mean(times)}")
-
-    return times_per_thread
-
-def plot_weak_scaling_bars(times_per_thread):
-    threads = sorted(times_per_thread.keys())
-
-    num_tasks_per_thread = {t: t * base_tasks for t in times_per_thread.keys()}
-    
-    t_seq = np.mean(times_per_thread[1])
-
-    # Dados para o gráfico
-    avg_times = [np.mean(times_per_thread[t]) for t in threads]
-    sems = [np.std(times_per_thread[t], ddof=1) / np.sqrt(len(times_per_thread[t])) for t in threads]
-    normalized_times = [t / t_seq for t in avg_times]
-
-    # Geração do gráfico
-    fig, ax1 = plt.subplots(figsize=FIGSIZE)
-
-    # Barras com tempo normalizado
-    bars = ax1.bar(
-        [str(t) for t in threads],
-        normalized_times,
-        yerr=sems,
-        capsize=4,
-        color="skyblue",
-        edgecolor='black',
-        label='Norm. Execution Time',
-    )
-
-    # # Rótulos numéricos nas barras
-    # for bar, value in zip(bars, normalized_times):
-    #     height = bar.get_height()
-    #     ax1.text(bar.get_x() + bar.get_width()/2, height + 0.02, f"{value:.2f}", ha='center', va='bottom', fontsize=9)
-    
-    ax1.set_xlabel("Number of vCPUs")
-    ax1.set_ylabel("Normalized Execution Time")
-    ax1.set_title("Weak Scalability - Normalized Times")
-    ax1.grid(True, axis='y', linestyle='--', alpha=0.5)
-    ax1.set_ylim(0, max(normalized_times) * 1.3)
-    plt.axhline(y=1.0, color='blue', linestyle='--', label="Sequential Execution")
-
-    # Segundo eixo Y para número de tarefas
-    ax2 = ax1.twinx()
-    tasks = [num_tasks_per_thread[t] for t in threads]
-    ax2.plot([str(t) for t in threads], tasks, color=COLORS["DARK_RED"], marker='o', linestyle='--', label='Number of tasks')
-    ax2.set_ylabel("Number of Tasks", color=COLORS["DARK_RED"])
-    ax2.tick_params(axis='y', labelcolor=COLORS["DARK_RED"])
-
-    # Legendas
-    ax1.legend(loc='upper left')
-    ax2.legend(loc='lower right')
-
-    plt.tight_layout()
-    plt.savefig(f"{PLOTS_DIR}_fraca.png")
-    print(f"Gráfico salvo em: {PLOTS_DIR}")
-    
+    plt.savefig("cv_l2_normalized.png")
+    # plt.show()
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    times = results_threads_strong()
-    plot_efficiency_vs_speedup(times)
-    plot_normalized_speedup(times)
-    # times = results_threads_weak()
-    # plot_weak_scaling_bars(times)
+    filename = "foo.txt"
+
+    # ---- Cache hit rates ----
+    totals = parse_and_aggregate_cache(filename)
+    summary = compute_mean_std(totals)
+    norm_rates = normalize_to_baseline(summary, baseline_key="RoundRobin")
+    plot_normalized_cache(norm_rates, baseline_key="RoundRobin")
+
+    # ---- Task waiting times ----
+    runs = parse_task_waiting_times(filename)
+
+    # CDF-only p99
+    summary_cdf = compute_percentile_summary(runs, percentile=99, normalize=False, cdf_only=True)
+    plot_percentile(summary_cdf, percentile=99, title="Task Waiting Time p99 (CDF strategies only)", filename="p99_cdf_only.png")
+
+    # All strategies normalized to Baseline
+    summary_all_norm = compute_percentile_summary(runs, percentile=99, baseline="RoundRobin", normalize=True, cdf_only=False)
+    plot_percentile(summary_all_norm, percentile=99, title="Normalized Task Waiting Time p99 (All strategies)", filename="p99_all_norm.png", excluded_baseline="RoundRobin")
+
+    # Execution's stacked times
+    time_means = aggregate_time_data(filename)
+    plot_stacked_times(time_means)
+    # ---- Compute CVs ----
+    totals1 = parse_and_aggregate_cache_per_group(filename)
+    cv_l2 = compute_cv_per_strategy_group(totals1)
+    norm_cv_l2 = normalize_cv(cv_l2, baseline="RoundRobin")
+
+    # ---- Plot ----
+    plot_normalized_cv(norm_cv_l2, baseline="RoundRobin")
+    
+    # Optional: print summary
+    print("---- Cache hit rates (absolute) ----")
+    for strat in sorted(summary.keys(), key=strategy_sort_key):
+        l1,l2,l3 = summary[strat]["L1"]["mean"], summary[strat]["L2"]["mean"], summary[strat]["L3"]["mean"]
+        print(f"{strat:>12} | L1={l1:.4f}  L2={l2:.4f}  L3={l3:.4f}")
+        
+    print("---- Task waiting time percentiles (CDF only) ----")
+    for s in sorted(summary_cdf.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | mean p99={summary_cdf[s]['mean']:.4f} ± {summary_cdf[s]['std']:.4f}")
+
+    print("---- Task waiting time percentiles normalized to Baseline ----")
+    for s in sorted(summary_all_norm.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | mean p99 normalized={summary_all_norm[s]['mean']:.4f} ± {summary_all_norm[s]['std']:.4f}")
+    print("CV of L2 accesses per strategy:")
+    for s in sorted(cv_l2.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | CV = {cv_l2[s]:.4f}")
+    print("Normalized CV to baseline:")
+    for s in sorted(norm_cv_l2.keys(), key=strategy_sort_key):
+        print(f"{s:>12} | Normalized CV = {norm_cv_l2[s]:.4f}")
+

@@ -45,8 +45,12 @@ use rand::{
     Rng,
     SeedableRng,
     rngs::StdRng,
+    distributions::{
+	Distribution,
+	WeightedIndex,
+    },
 };
-use rand_distr::{Zipf, Distribution};
+use rand_distr::Zipf;
 
 
 fn main() {
@@ -81,19 +85,13 @@ fn main() {
 	    Arc::clone(&ram)
 	).await.expect("Failed to create VM");	    
 	debug!("Initiating... {:?}", thread::current().id());
-	
-	let zipf = Zipf::new(1_000_000, 1.0).unwrap();
+	let zipf = Zipf::new(100_000, 1.0).unwrap();	
+	// let zipf = Zipf::new(100_000, 0.8).unwrap();
 	let base = 0x0000_4000_0000;
 	let page_size = 4096;
 	for i in 0..total {
-	    let workload_size = rng.gen_range(2000..=6000);
-	    // let workload_size = 900;
-
-	    // TODO: The addresses will, ideally, come from a file (read in args.rs)
-	    //       If no file is read, then we generate it (ideally, following a distribution)
-	    // let addresses: Vec<Addr> = (0..workload_size)
-	    // 	.map(|_| Addr::new(rng.r#gen())) // For some reason, .gen() was conflicting with something (?)
-	    // 	.collect();
+	    // let workload_size = rng.gen_range(5000..=6000);
+	    let workload_size = 3000;
 	    let addresses: Vec<Addr> = (0..workload_size)
 		.map(|_| {
 		    let page_index = zipf.sample(&mut rng) as u64;

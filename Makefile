@@ -40,7 +40,7 @@ PLOTS_VENV_DIRECTORY := $(PLOTS_DIRECTORY)/venv
 all-plots:
 	@if [ ! -d $(PLOTS_VENV_DIRECTORY) ]; then python3 -m venv $(PLOTS_VENV_DIRECTORY); fi
 	@$(PLOTS_VENV_DIRECTORY)/bin/pip3 install -r ./scripts/plot/requirements.txt > /dev/null
-	@$(PLOTS_VENV_DIRECTORY)/bin/python3 $(PLOTS_DIRECTORY)/new.py
+	@$(PLOTS_VENV_DIRECTORY)/bin/python3 $(PLOTS_DIRECTORY)/results.py
 
 check: check-v_sim
 

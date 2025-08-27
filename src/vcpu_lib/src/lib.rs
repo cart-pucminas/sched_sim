@@ -98,7 +98,7 @@ impl VCPU {
     pub async fn vcpu_loop(
 	vcpu: Arc<Mutex<Self>>,
 	mut receiver: Receiver<(Task, Sender<Task>)>
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {	   
 	while let Some((mut task, responder)) = receiver.recv().await {
 	    if task.first_response_time.is_none() {
 		let now = Instant::now();
@@ -132,8 +132,8 @@ impl VCPU {
 		let virt_address = address.address_virtual_address();
 		
 		// Latency to access RAM (not using TLB)
-		sleep(Duration::from_micros(30_000)).await;
 		let phys_address = loop {
+		    sleep(Duration::from_nanos(100)).await;
 
 		    match vcpu.mmu.translate(task_cr3, virt_address).await {
 			TranslateResult::Hit(p) => {
@@ -147,7 +147,7 @@ impl VCPU {
 		};
 	
 		// Latency to access L1
-		sleep(Duration::from_nanos(2_000)).await;
+		sleep(Duration::from_nanos(2)).await;
 		let (block_l1, index_l1) = vcpu.cache_l1.cache_lookup(phys_address);
 		if let Some(block) = block_l1 {
 		    task.update_hotness(index_l1.unwrap() as usize);
@@ -155,7 +155,8 @@ impl VCPU {
 		}
 
 		// Latency to access L2
-		sleep(Duration::from_nanos(4_000)).await;
+		sleep(Duration::from_nanos(6)).await;
+		task.task_mem_accesses += 1;
 		let (block_l2, index_l2) = {
 		    let mut l2 = vcpu.cache_l2.lock().await;
 		    l2.cache_lookup(phys_address)
@@ -165,9 +166,10 @@ impl VCPU {
 		    vcpu.cache_l1.cache_update(phys_address, block.clone());
 		    continue
 		}
+		task.task_mem_misses += 1;
 
 		// Latency to access L3
-		sleep(Duration::from_nanos(13_000)).await;
+		sleep(Duration::from_nanos(20)).await;
 		let (block_l3, index_l3) = {
 		    let mut l3 = vcpu.cache_l3.lock().await;
 		    l3.cache_lookup(phys_address)

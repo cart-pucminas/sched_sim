@@ -65,7 +65,10 @@ pub struct Task
     pub accumulated_exec_time   : Duration,
     pub last_left_time          : Option<Instant>,
 					 
-    
+
+    pub task_mem_accesses       : u64,
+    pub task_mem_misses         : u64,
+    pub task_intensity          : f64,
 }
 
 //==================================================================================================
@@ -105,21 +108,21 @@ impl Task
 	// Ideally window_size must be equal (or less) than VM's quantum
 	let window_size = 300 as usize;
 	Self {
-	    ts_id: id,
-	    ts_name: name.to_string(),
-	    ts_total_workload: workload,
-	    ts_left_workload: workload,
-	    ts_current_exectime: 0,
-	    ts_mem_addresses: addresses,
-	    ts_mem_indexer: 0,
-	    ts_cr3: cr3,
+	    ts_id			: id,
+	    ts_name			: name.to_string(),
+	    ts_total_workload		: workload,
+	    ts_left_workload		: workload,
+	    ts_current_exectime		: 0,
+	    ts_mem_addresses		: addresses,
+	    ts_mem_indexer		: 0,
+	    ts_cr3			: cr3,
 
-	    ts_window_size: window_size,
-	    ts_cache_acesses: HashMap::new(),
-	    ts_recent_acesses: VecDeque::with_capacity(window_size),
-	    ts_previous_accesses: VecDeque::with_capacity(window_size * 2),
-	    ts_last_vcpu_id: usize::MAX,
-	    ts_current_vcpu_id: usize::MAX,
+	    ts_window_size		: window_size,
+	    ts_cache_acesses		: HashMap::new(),
+	    ts_recent_acesses		: VecDeque::with_capacity(window_size),
+	    ts_previous_accesses	: VecDeque::with_capacity(window_size * 2),
+	    ts_last_vcpu_id		: usize::MAX,
+	    ts_current_vcpu_id		: usize::MAX,
 
 	    arrival_time		: Instant::now(),
 	    start_time			: None,
@@ -127,6 +130,10 @@ impl Task
 	    accumulated_wait_time	: Duration::from_nanos(0),
 	    accumulated_exec_time	: Duration::from_nanos(0),
 	    last_left_time		: None,
+	    
+	    task_mem_accesses		: 0,
+	    task_mem_misses		: 0,
+	    task_intensity		: 0f64,
 	}
 	
     }
@@ -215,6 +222,13 @@ impl Task
     pub fn task_mem_indexer(&self) -> u64
     {
 	self.ts_mem_indexer
+    }
+
+    pub fn task_update_intensity(&mut self) -> f64 {
+	if self.task_mem_accesses > 0 {
+	    self.task_intensity = self.task_mem_misses as f64 / self.task_mem_accesses as f64;
+	}
+	self.task_intensity
     }
 
     pub fn task_get_cr3(&self) -> u64
